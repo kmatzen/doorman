@@ -1,0 +1,287 @@
+// Loads `/etc/doorman/doorman.yaml`. Every field of every entry is required
+// up-front and the whole file is validated before any request is served — if
+// the parse fails, the daemon refuses to start. That is one of the
+// fail-closed defaults the spec calls out.
+
+use std::collections::HashSet;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+use serde::Deserialize;
+
+/// One credential the daemon holds in memory and may inject into outgoing
+/// requests. The fields mirror the YAML one-to-one; everything else (parsed
+/// header name, prefix, suffix) is computed in [`Entry::from_raw`].
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub name: String,
+    pub secret: String,
+    /// The header doorman sets on the outgoing request, e.g. `Authorization`.
+    pub header_name: String,
+    /// Text before the `{}` slot in the inject template.
+    pub header_prefix: String,
+    /// Text after the `{}` slot in the inject template.
+    pub header_suffix: String,
+    /// Lower-cased host allowlist.
+    pub hosts: Vec<String>,
+    /// Upper-cased method allowlist; empty means "any method".
+    pub methods: Vec<String>,
+}
+
+impl Entry {
+    /// Render the full header value the upstream will see. Pulled out so the
+    /// proxy and the tests share one definition.
+    pub fn render(&self) -> String {
+        let mut s = String::with_capacity(self.header_prefix.len() + self.secret.len() + self.header_suffix.len());
+        s.push_str(&self.header_prefix);
+        s.push_str(&self.secret);
+        s.push_str(&self.header_suffix);
+        s
+    }
+
+    pub fn host_allowed(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.hosts.contains(&host)
+    }
+
+    pub fn method_allowed(&self, method: &str) -> bool {
+        if self.methods.is_empty() {
+            return true;
+        }
+        let method = method.to_ascii_uppercase();
+        self.methods.contains(&method)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEntry {
+    name: String,
+    secret: String,
+    inject: String,
+    hosts: Vec<String>,
+    #[serde(default)]
+    methods: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub entries: Vec<Entry>,
+}
+
+impl Config {
+    pub fn lookup(&self, name: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+}
+
+/// Read, validate, and return the config. With `enforce_mode_0400` true the
+/// loader refuses any file whose permissions are looser than 0400 — the spec
+/// makes this non-negotiable for production. Tests pass `false` because temp
+/// files don't always honor restrictive modes.
+pub fn load(path: &Path, enforce_mode_0400: bool) -> Result<Config, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("stat {}: {}", path.display(), e))?;
+    if enforce_mode_0400 {
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o400 {
+            return Err(format!(
+                "config {} must be mode 0400, got {:#o}",
+                path.display(),
+                mode
+            ));
+        }
+    }
+    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let entries: Vec<RawEntry> = serde_yaml::from_str(&raw).map_err(|e| format!("parse: {}", e))?;
+    if entries.is_empty() {
+        return Err("config has no entries; refusing to start".into());
+    }
+
+    let mut seen_names = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, raw) in entries.into_iter().enumerate() {
+        let entry = parse_entry(i, raw)?;
+        if !seen_names.insert(entry.name.clone()) {
+            return Err(format!("duplicate credential name {:?}", entry.name));
+        }
+        out.push(entry);
+    }
+    Ok(Config { entries: out })
+}
+
+fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
+    let where_ = || format!("entry[{}]", idx);
+    if r.name.is_empty() {
+        return Err(format!("{}: name is empty", where_()));
+    }
+    if !r.name.chars().all(is_name_char) {
+        return Err(format!(
+            "{}: name {:?} must be ASCII letters, digits, _, -, .",
+            where_(),
+            r.name
+        ));
+    }
+    if r.secret.is_empty() {
+        return Err(format!("{} {:?}: secret is empty", where_(), r.name));
+    }
+    if r.hosts.is_empty() {
+        return Err(format!("{} {:?}: hosts list is empty", where_(), r.name));
+    }
+    let hosts: Vec<String> = r.hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
+    for h in &hosts {
+        if h.contains('/') || h.contains(':') || h.is_empty() {
+            return Err(format!(
+                "{} {:?}: host {:?} must be a bare hostname (no scheme, no port, no path)",
+                where_(),
+                r.name,
+                h
+            ));
+        }
+    }
+
+    let methods: Vec<String> = r
+        .methods
+        .unwrap_or_default()
+        .iter()
+        .map(|m| m.to_ascii_uppercase())
+        .collect();
+    for m in &methods {
+        if !is_valid_method(m) {
+            return Err(format!(
+                "{} {:?}: invalid HTTP method {:?}",
+                where_(),
+                r.name,
+                m
+            ));
+        }
+    }
+
+    let (header_name, header_prefix, header_suffix) = parse_inject(&r.inject)
+        .map_err(|e| format!("{} {:?}: inject {:?}: {}", where_(), r.name, r.inject, e))?;
+
+    Ok(Entry {
+        name: r.name,
+        secret: r.secret,
+        header_name,
+        header_prefix,
+        header_suffix,
+        hosts,
+        methods,
+    })
+}
+
+/// Parse a string like `Authorization: Bearer {}` into
+/// `("Authorization", "Bearer ", "")`. Exactly one `{}` slot, exactly one
+/// colon separating header name from value template.
+fn parse_inject(s: &str) -> Result<(String, String, String), String> {
+    let colon = s.find(':').ok_or("missing ':' between header name and value")?;
+    let name = s[..colon].trim();
+    if name.is_empty() {
+        return Err("header name is empty".into());
+    }
+    if !name.chars().all(is_header_name_char) {
+        return Err("header name has invalid characters".into());
+    }
+    let value = s[colon + 1..].trim_start();
+
+    let slot_count = value.matches("{}").count();
+    if slot_count != 1 {
+        return Err(format!("value template must contain exactly one '{{}}' slot, found {}", slot_count));
+    }
+    let slot = value.find("{}").unwrap();
+    let prefix = &value[..slot];
+    let suffix = &value[slot + 2..];
+
+    // Reject any other braces; the template is dead-simple by design.
+    if prefix.contains('{') || prefix.contains('}') || suffix.contains('{') || suffix.contains('}') {
+        return Err("value template may only contain a single '{}' slot".into());
+    }
+
+    Ok((name.to_string(), prefix.to_string(), suffix.to_string()))
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+fn is_header_name_char(c: char) -> bool {
+    // RFC 7230 token: very permissive but excludes whitespace/control/separators.
+    c.is_ascii_graphic() && !matches!(c, '(' | ')' | ',' | '/' | ':' | ';' | '<' | '=' | '>' | '?' | '@' | '[' | '\\' | ']' | '{' | '}' | '"')
+}
+
+fn is_valid_method(m: &str) -> bool {
+    matches!(m, "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(yaml: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let i = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("doorman_cfg_{}_{}.yaml", std::process::id(), i));
+        std::fs::write(&p, yaml).unwrap();
+        p
+    }
+
+    #[test]
+    fn parses_minimal() {
+        let p = write_tmp("- name: github\n  secret: ghp_x\n  inject: 'Authorization: Bearer {}'\n  hosts: [api.github.com]\n");
+        let cfg = load(&p, false).unwrap();
+        assert_eq!(cfg.entries.len(), 1);
+        let e = &cfg.entries[0];
+        assert_eq!(e.name, "github");
+        assert_eq!(e.header_name, "Authorization");
+        assert_eq!(e.header_prefix, "Bearer ");
+        assert_eq!(e.header_suffix, "");
+        assert_eq!(e.render(), "Bearer ghp_x");
+        assert!(e.host_allowed("api.github.com"));
+        assert!(e.host_allowed("API.GitHub.com"));
+        assert!(!e.host_allowed("attacker.com"));
+        assert!(e.method_allowed("GET"));
+        assert!(e.method_allowed("anything")); // empty list = allow all
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_duplicate_names() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n- name: a\n  secret: y\n  inject: 'X: {}'\n  hosts: [b.com]\n");
+        assert!(load(&p, false).unwrap_err().contains("duplicate"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_no_slot() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: literal'\n  hosts: [a.com]\n");
+        assert!(load(&p, false).unwrap_err().contains("'{}'"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_two_slots() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {} {}'\n  hosts: [a.com]\n");
+        assert!(load(&p, false).unwrap_err().contains("'{}'"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_host_with_scheme() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['https://a.com']\n");
+        assert!(load(&p, false).unwrap_err().contains("bare hostname"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn methods_uppercased_and_validated() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [get, post]\n");
+        let cfg = load(&p, false).unwrap();
+        let e = &cfg.entries[0];
+        assert!(e.method_allowed("GET"));
+        assert!(e.method_allowed("post"));
+        assert!(!e.method_allowed("DELETE"));
+        std::fs::remove_file(&p).ok();
+    }
+}

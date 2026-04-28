@@ -1,0 +1,21 @@
+- name: github
+  secret: ghp_replace_me
+  inject: "Authorization: Bearer {}"
+  hosts: [api.github.com]
+
+- name: github_readonly
+  secret: ghp_replace_me_too
+  inject: "Authorization: Bearer {}"
+  hosts: [api.github.com]
+  methods: [GET]
+
+- name: stripe
+  secret: sk_live_replace_me
+  inject: "Authorization: Bearer {}"
+  hosts: [api.stripe.com]
+  methods: [GET]
+
+- name: slack
+  secret: xoxb-replace-me
+  inject: "Authorization: Bearer {}"
+  hosts: [slack.com]
