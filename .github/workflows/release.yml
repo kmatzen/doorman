@@ -16,6 +16,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write       # OIDC token for sigstore signing
+  attestations: write   # publish build provenance attestations
 
 env:
   CARGO_TERM_COLOR: always
@@ -106,6 +108,11 @@ jobs:
           (cd dist && tar -czf "${NAME}.tar.gz" "${NAME}")
           ls -lh "dist/${NAME}.tar.gz"
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -115,8 +122,6 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -125,8 +130,16 @@ jobs:
           merge-multiple: true
       - name: List artifacts
         run: ls -lh dist/
+      - name: Compute SHA256SUMS
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: Attest SHA256SUMS
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
