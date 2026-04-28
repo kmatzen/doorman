@@ -21,7 +21,7 @@ use doorman::{audit, config, proxy};
 
 const DEFAULT_CONFIG: &str = "/etc/doorman/doorman.yaml";
 const DEFAULT_AUDIT: &str = "/var/log/doorman/audit.log";
-const DEFAULT_LISTEN: &str = "127.0.0.1:8443";
+const DEFAULT_LISTEN: &str = "127.0.0.1:18443";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
