@@ -102,13 +102,13 @@ doormand run \
 ## Use
 
 ```
-export HTTP_PROXY=http://127.0.0.1:8443
+export HTTP_PROXY=http://127.0.0.1:18443
 ```
 
 Use `http://` URLs in agent code even when the upstream is HTTPS — doorman terminates plaintext on its side and re-originates TLS to the upstream. Pick a credential by setting `X-Doorman-Cred: <name>` on the request:
 
 ```
-curl --proxy http://127.0.0.1:8443 \
+curl --proxy http://127.0.0.1:18443 \
      -H 'X-Doorman-Cred: github' \
      http://api.github.com/repos/acme/widgets/issues
 ```

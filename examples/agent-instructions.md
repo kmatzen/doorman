@@ -23,7 +23,7 @@ call one of those services, route the request through doorman and it
 will inject the key for you. For any other network access, use the
 network as you normally would — doorman is not a network filter.
 
-**Proxy:** `http://127.0.0.1:8443`
+**Proxy:** `http://127.0.0.1:18443`
 
 **Credentials available** (selected by `X-Doorman-Cred` header):
 
@@ -44,7 +44,7 @@ upstream is HTTPS — doorman handles the TLS upgrade. Set
 ### curl
 
 ```sh
-curl --proxy http://127.0.0.1:8443 \
+curl --proxy http://127.0.0.1:18443 \
      -H 'X-Doorman-Cred: github_readonly' \
      http://api.github.com/repos/acme/widgets/issues
 ```
@@ -56,7 +56,7 @@ import httpx
 r = httpx.get(
     "http://api.github.com/repos/acme/widgets/issues",
     headers={"X-Doorman-Cred": "github_readonly"},
-    proxy="http://127.0.0.1:8443",
+    proxy="http://127.0.0.1:18443",
 )
 ```
 
@@ -68,7 +68,7 @@ const r = await fetch(
   "http://api.github.com/repos/acme/widgets/issues",
   {
     headers: { "X-Doorman-Cred": "github_readonly" },
-    dispatcher: new ProxyAgent("http://127.0.0.1:8443"),
+    dispatcher: new ProxyAgent("http://127.0.0.1:18443"),
   },
 );
 ```
