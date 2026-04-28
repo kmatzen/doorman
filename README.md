@@ -44,18 +44,18 @@ brew install doorman
 ### Quick install (curl)
 
 ```
-curl -sSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh | sh
 ```
 
 The script detects your platform, downloads the matching release tarball, verifies it against the published `SHA256SUMS` (and the sigstore attestation if `gh` is on PATH), and installs the binary to `/usr/local/bin/doormand`. To review before running:
 
 ```
-curl -sSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh -o install.sh
+curl -fsSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh -o install.sh
 less install.sh
 sh install.sh
 ```
 
-`DOORMAN_VERSION=v0.1.3` and `DOORMAN_PREFIX=$HOME/.local/bin` env vars override the release tag and install dir respectively.
+`DOORMAN_VERSION=v0.1.4` and `DOORMAN_PREFIX=$HOME/.local/bin` env vars override the release tag and install dir respectively.
 
 ### From a release tarball
 
