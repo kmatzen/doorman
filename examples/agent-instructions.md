@@ -15,12 +15,13 @@ own `doorman.yaml`.
 
 ---
 
-## Network access
+## Using credentials held by the operator
 
-You have outbound network access only via doorman, an HTTP forward proxy
-running locally. Direct connections to the internet will fail. Use the
-proxy for any shell command, generated code, or tool call that needs to
-reach the network.
+The operator stores API keys for certain services with **doorman**, a
+local HTTP proxy. You do not have those keys directly. When you need to
+call one of those services, route the request through doorman and it
+will inject the key for you. For any other network access, use the
+network as you normally would — doorman is not a network filter.
 
 **Proxy:** `http://127.0.0.1:8443`
 
@@ -35,9 +36,10 @@ You name a credential by label. Doorman holds the secret and injects the
 auth header. If you target a host the credential is not allowed for,
 doorman returns 403 — pick a different credential or stop and ask.
 
-The URL must use `http://` even when the upstream is HTTPS — doorman
-handles the TLS upgrade. Set `X-Doorman-Cred` on every request; do not
-add an `Authorization` header (doorman overwrites it).
+When going through doorman, the URL must use `http://` even though the
+upstream is HTTPS — doorman handles the TLS upgrade. Set
+`X-Doorman-Cred` on every request; do not set `Authorization` yourself
+(doorman overwrites it).
 
 ### curl
 
@@ -71,8 +73,9 @@ const r = await fetch(
 );
 ```
 
-### What not to do
+### Don't
 
-- Do not attempt to reach the network without the proxy; it will not work.
-- Do not try to read or echo the secret. Doorman never reveals it.
-- Do not set `Authorization` yourself. Doorman overwrites it.
+- Don't try to read or echo the secret. Doorman never reveals it; only
+  the credential's label is meaningful to you.
+- Don't set `Authorization` yourself when going through doorman. It will
+  be overwritten.

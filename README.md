@@ -191,15 +191,9 @@ No bodies, no headers, no secrets.
 
 ## Using doorman with coding agents
 
-Doorman is designed for the case where an LLM agent generates and runs network calls during tool use — `curl`, generated Python, shell commands. The agent has full control over the request it constructs, so adding `--proxy` and `X-Doorman-Cred: <name>` is something it does on instruction.
+Doorman is for the case where an LLM agent generates network calls during tool use — `curl`, generated Python, shell commands — and some of those calls need credentials that you, the operator, don't want to hand to the agent directly. The agent retains full network access; doorman is not a network filter. Its job is to be the only path to *your* keys: the agent never holds them, so it can't leak them or send them to a host they aren't allowlisted for, no matter what the rest of its outbound traffic looks like.
 
-Two pieces have to be in place:
-
-1. **Tell the agent doorman exists.** Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the file your agent reads as system instructions (`CLAUDE.md` for Claude Code, `.cursorrules` for Cursor, an `--read` file for Aider). The instructions list available credential names, the proxy URL, and call patterns for `curl` / `httpx` / `undici`.
-
-2. **Confine egress so doorman is the only way out.** Doorman is an authorization boundary, not a network filter. An agent that ignores its instructions can call attacker.com directly unless the OS prevents it. Use a per-uid firewall rule, a network namespace, or a container network policy that blocks all outbound traffic except to doorman's listener. On Linux, the simplest form is an `iptables` egress rule scoped to the agent's uid; on macOS, `pf` rules; in containers, a network policy that whitelists only the proxy address.
-
-Without (2), the agent can bypass doorman. Without (1), it doesn't know how to use it. Both are required.
+Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the file your agent reads as system instructions (`CLAUDE.md` for Claude Code, `.cursorrules` for Cursor, an `--read` file for Aider). It tells the agent which credentials doorman holds and how to invoke them via the proxy. The agent uses doorman when it needs one of those credentials, and calls the network directly otherwise.
 
 ## Threat model
 
@@ -222,9 +216,8 @@ Without (2), the agent can bypass doorman. Without (1), it doesn't know how to u
 3. **Host compromise.** Kernel exploits, root, ptrace from a privileged uid, or a tampered doorman binary defeat everything. Verify release artifacts before installing.
 4. **Allowlist enumeration.** The agent can probe credential/host pairs and observe allow/deny. Treat the allowlist itself as non-secret.
 5. **Co-tenant processes.** Any process that can reach doorman's listening socket can issue requests as the agent. Pin the listener to loopback (default) and ensure only the agent uid can reach it.
-6. **Egress confinement.** Doorman does not prevent the agent from making direct network calls that bypass the proxy. An agent that ignores instructions can reach attacker.com itself unless the OS forbids it. The operator must enforce egress restriction at the OS level — per-uid firewall rule, network namespace, or container network policy — so doorman is the only outbound path.
-7. **Network adversaries past doorman.** Doorman validates upstream TLS against Mozilla's `webpki-roots`, statically linked at build time. It does not pin certificates and does not consult the system trust store.
-8. **Side channels.** Timing, response-size, and audit-volume side channels are not mitigated.
+6. **Network adversaries past doorman.** Doorman validates upstream TLS against Mozilla's `webpki-roots`, statically linked at build time. It does not pin certificates and does not consult the system trust store.
+7. **Side channels.** Timing, response-size, and audit-volume side channels are not mitigated.
 
 ### macOS deployments
 
