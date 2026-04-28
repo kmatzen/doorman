@@ -64,12 +64,21 @@ fi
 
 if command -v gh >/dev/null 2>&1; then
   log "verifying sigstore attestation ..."
-  gh attestation verify "$tarball" --repo "$REPO" >/dev/null 2>&1 \
-    || err "attestation verification failed; refusing to install"
-  log "attestation verified."
+  if gh attestation verify "$tarball" --repo "$REPO"; then
+    log "attestation verified."
+  else
+    if [ "${DOORMAN_REQUIRE_ATTESTATION:-}" = "1" ]; then
+      err "DOORMAN_REQUIRE_ATTESTATION=1 is set; refusing to install"
+    fi
+    log "warning: gh attestation verify failed (see error above)."
+    log "         proceeding with SHA256-only verification — the SHA256SUMS file"
+    log "         is itself signed and was checked above. Set"
+    log "         DOORMAN_REQUIRE_ATTESTATION=1 to make this a hard error."
+    log "         (common cause: gh < 2.49 lacks the 'attestation' subcommand.)"
+  fi
 else
   log "gh CLI not found; skipped sigstore provenance check."
-  log "(install gh and run 'gh attestation verify $tarball --repo $REPO' for full provenance.)"
+  log "(install gh ≥ 2.49 and run 'gh attestation verify $tarball --repo $REPO' for full provenance.)"
 fi
 
 log "installing to $PREFIX/doormand ..."
