@@ -32,6 +32,22 @@ Any deny is a 403 with a one-line JSON error body, plus an audit entry.
 
 ## Install
 
+### Quick install
+
+```
+curl -sSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh | sh
+```
+
+The script detects your platform, downloads the matching release tarball, verifies it against the published `SHA256SUMS` (and the sigstore attestation if `gh` is on PATH), and installs the binary to `/usr/local/bin/doormand`. To review before running:
+
+```
+curl -sSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+`DOORMAN_VERSION=v0.1.3` and `DOORMAN_PREFIX=$HOME/.local/bin` env vars override the release tag and install dir respectively.
+
 ### From a release tarball
 
 Each release ships per-platform tarballs (`doorman-<version>-<target>.tar.gz`) with the binary, the README, the example config, and the appropriate service file. Releases starting with v0.1.3 also publish a `SHA256SUMS` file and a sigstore-signed build-provenance attestation for every artifact, recorded in the public Rekor transparency log.
