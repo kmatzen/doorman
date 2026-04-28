@@ -1,0 +1,24 @@
+[Unit]
+Description=doorman HTTP credential proxy
+After=network.target
+
+[Service]
+ExecStart=__BIN_PATH__ run
+User=doorman
+Group=doorman
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/log/doorman
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

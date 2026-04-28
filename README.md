@@ -41,23 +41,54 @@ Any deny along the way is a 403 with a one-line JSON error body, plus an audit e
 
 ## Install
 
-Build:
+### From a release tarball
+
+Each release ships per-platform tarballs (`doorman-<version>-<target>.tar.gz`) with the binary, the docs, the example config, and the appropriate service file.
+
+```
+tar -xzf doorman-0.1.0-aarch64-apple-darwin.tar.gz
+cd doorman-0.1.0-aarch64-apple-darwin
+sudo install -m 0755 doormand /usr/local/bin/doormand
+```
+
+### From source
 
 ```
 cargo build --release
 sudo install -m 0755 target/release/doormand /usr/local/bin/doormand
 ```
 
+To produce a tarball yourself: `make release`. The result lands in `dist/`.
+
+### Configure and start
+
 Write a config (mode 0400, owned by the doorman uid) — see [Config](#config). Then for production:
+
+**Linux (systemd):**
 
 ```
 doormand install-service | sudo tee /etc/systemd/system/doormand.service
 sudo systemctl enable --now doormand
 ```
 
-`install-service` prints a systemd unit tailored to the binary's path; it doesn't write anything itself. The unit it prints runs doorman as `User=doorman`, with `NoNewPrivileges`, dropped capabilities, and `PR_SET_DUMPABLE=0` so the agent can't ptrace it.
+**macOS (launchd):**
 
-For development, skip systemd and run directly:
+```
+sudo mkdir -p /var/log/doorman
+sudo dscl . -create /Users/_doorman UserShell /usr/bin/false
+sudo dscl . -create /Groups/_doorman PrimaryGroupID 401
+sudo dscl . -create /Users/_doorman PrimaryGroupID 401
+sudo dscl . -create /Users/_doorman UniqueID 401
+sudo chown -R _doorman:_doorman /var/log/doorman /etc/doorman
+doormand install-service | sudo tee /Library/LaunchDaemons/com.doorman.doormand.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.doorman.doormand.plist
+```
+
+`install-service` detects the platform and prints a systemd unit on Linux, a launchd plist on macOS. The systemd unit runs doorman as `User=doorman`, with `NoNewPrivileges`, dropped capabilities, and `PR_SET_DUMPABLE=0` so the agent can't ptrace it. The launchd plist runs as `_doorman` with `ProcessType=Background`; macOS's hardening primitives are weaker than systemd's, so do not rely on launchd alone for the uid-isolation guarantees on Linux-class production hosts.
+
+### Run directly (development)
+
+For local testing without bothering with a service manager:
 
 ```
 doormand run \
@@ -132,14 +163,13 @@ There are no conditionals, includes, environments, or templating beyond the `{}`
 One JSON line per request, fsync'd before the next request is served. Default path `/var/log/doorman/audit.log`, mode 0640.
 
 ```json
-{"ts":"2026-04-27T14:22:01Z","pid":-1,"uid":-1,"cred":"github","host":"api.github.com","method":"GET","path":"/repos/acme/widgets/issues","status":200,"bytes_in":0,"bytes_out":8421,"ms":234,"decision":"allow"}
+{"ts":"2026-04-27T14:22:01Z","cred":"github","host":"api.github.com","method":"GET","path":"/repos/acme/widgets/issues","status":200,"bytes_in":0,"bytes_out":8421,"ms":234,"decision":"allow"}
 ```
 
 | field | meaning |
 | --- | --- |
 | `ts` | RFC 3339 UTC timestamp at request completion |
-| `pid` / `uid` | OS peer credentials of the agent (currently always `-1`; see Limitations) |
-| `cred` | credential name used (omitted on placeholder-not-found denies) |
+| `cred` | credential name used (omitted on cred-header-missing denies) |
 | `host`, `method`, `path` | upstream destination |
 | `status` | HTTP status returned to the agent (403 on doorman denies, upstream status on allows) |
 | `bytes_in` | request body bytes uploaded to the upstream |
@@ -174,7 +204,7 @@ The threat model assumes the agent process is hostile from the moment it starts:
 
 ## Limitations
 
-- **`pid` and `uid` in audit lines are always `-1`.** TCP sockets don't carry peer credentials the way Unix sockets do. If multiple uids on the host can reach the proxy port, you can't distinguish them in the log. The intended deployment has exactly one uid (the agent) able to reach `127.0.0.1:8443`; enforce that with a netns or firewall.
+- **No peer-process identification in audit lines.** TCP sockets don't carry peer credentials the way Unix sockets do, so doorman can't record the agent's pid or uid. The intended deployment has exactly one uid (the agent) able to reach `127.0.0.1:8443`; enforce that with a netns or firewall, and run a separate doorman per agent if you need to keep their traffic separate in the log.
 - **Audit gaps on the allow path.** Audit writes for allowed requests happen at end-of-stream. If an audit write fails mid-day (disk full, etc.), the agent has already received the response — doorman logs the failure to stderr and keeps serving. Deny-path audit is still pre-response and hard fails closed.
 - **Agent must use `http://` URLs.** Even though the upstream is HTTPS, the agent addresses doorman with `http://` scheme. This trades familiarity for a much smaller proxy and no trust-store install.
 - **Upstream port is always 443.** Any port in the agent's URI is ignored. Add a `port` field to the config if you need something else.

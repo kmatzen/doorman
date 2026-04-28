@@ -383,8 +383,6 @@ fn deny(
 
     let rec = Record {
         ts: audit::now_rfc3339(),
-        pid: -1,
-        uid: -1,
         cred,
         host: target_host,
         method,
@@ -515,8 +513,6 @@ fn build_audit_callback(ctx: AuditCtx) -> Box<dyn FnOnce() + Send + Sync> {
     Box::new(move || {
         let rec = Record {
             ts: audit::now_rfc3339(),
-            pid: -1,
-            uid: -1,
             cred: Some(&ctx.cred),
             host: &ctx.host,
             method: &ctx.method,

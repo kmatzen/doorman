@@ -81,12 +81,10 @@ Step 7 is the one piece of "smart" behavior worth keeping, because some upstream
 One line per request, JSON, append-only:
 
 ```json
-{"ts":"2026-04-27T14:22:01Z","pid":-1,"uid":-1,"cred":"github","host":"api.github.com","method":"GET","path":"/repos/acme/widgets/issues","status":200,"bytes_in":0,"bytes_out":8421,"ms":234,"decision":"allow"}
+{"ts":"2026-04-27T14:22:01Z","cred":"github","host":"api.github.com","method":"GET","path":"/repos/acme/widgets/issues","status":200,"bytes_in":0,"bytes_out":8421,"ms":234,"decision":"allow"}
 ```
 
-No bodies. No headers. No secret. The path is logged because operators need to debug; if a path contains a secret (it shouldn't, but APIs are weird), that's an upstream problem, not doorman's.
-
-`pid` and `uid` are placeholders for now — TCP listening means there's no `SO_PEERCRED` to read. Multi-uid hosts that can reach the proxy port can't be distinguished in the log. Operationally usually fine; document the gap.
+No bodies. No headers. No secret. No peer pid or uid — TCP listening means there's no `SO_PEERCRED` to read, and a field that's always the same value is noise. The intended deployment is one agent uid per doorman; if you have multiple agents whose traffic you want to separate, run multiple daemons. The path is logged because operators need to debug; if a path contains a secret (it shouldn't, but APIs are weird), that's an upstream problem, not doorman's.
 
 ## Security properties
 

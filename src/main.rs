@@ -1,7 +1,8 @@
 // Entry point. Two subcommands:
 //
 //   doormand install-service
-//       Print a systemd unit tailored to this binary's path. (Just prints;
+//       Print a service definition tailored to this binary's path —
+//       a systemd unit on Linux, a launchd plist on macOS. (Just prints;
 //       the operator redirects it where they want it.)
 //
 //   doormand run [--config PATH] [--audit PATH] [--listen ADDR]
@@ -29,7 +30,7 @@ fn main() -> ExitCode {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("");
     let rest = &args[args.len().min(1)..];
     let result = match cmd {
-        "install-service" => cmd_install_service(),
+        "install-service" => cmd_install_service(rest),
         "run" => cmd_run(rest),
         "" | "-h" | "--help" => {
             print_usage();
@@ -54,40 +55,57 @@ fn print_usage() {
     eprintln!(
         "doormand — an HTTP proxy that holds your API keys.\n\n\
          usage:\n  \
-           doormand install-service\n  \
+           doormand install-service [--bin-path PATH]\n  \
            doormand run [--config PATH] [--audit PATH] [--listen ADDR]\n"
     );
 }
 
-fn cmd_install_service() -> Result<(), String> {
-    let bin = std::env::current_exe().map_err(|e| format!("locate self: {}", e))?;
-    println!("# systemd unit (write to /etc/systemd/system/doormand.service):");
-    println!(
-"[Unit]
-Description=doorman HTTP credential proxy
-After=network.target
-
-[Service]
-ExecStart={} run
-User=doorman
-Group=doorman
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-CapabilityBoundingSet=
-AmbientCapabilities=
-LockPersonality=true
-RestrictRealtime=true
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-ReadWritePaths=/var/log/doorman
-Restart=on-failure
-RestartSec=2s
-
-[Install]
-WantedBy=multi-user.target", bin.display());
+fn cmd_install_service(args: &[String]) -> Result<(), String> {
+    // Default to where the running binary lives. Packaging scripts override
+    // with --bin-path so the emitted unit/plist points at the eventual
+    // install location (e.g. /usr/local/bin/doormand) rather than wherever
+    // the build artifact happens to sit.
+    let mut bin = std::env::current_exe()
+        .map_err(|e| format!("locate self: {}", e))?
+        .display()
+        .to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bin-path" => {
+                bin = args
+                    .get(i + 1)
+                    .ok_or("missing value for --bin-path")?
+                    .clone();
+                i += 2;
+            }
+            other => return Err(format!("install-service: unknown flag {:?}", other)),
+        }
+    }
+    if cfg!(target_os = "macos") {
+        print_launchd_plist(&bin);
+    } else {
+        print_systemd_unit(&bin);
+    }
     Ok(())
+}
+
+// Templates for the service definitions. Lifted from share/ at compile time
+// so the binary has no runtime file dependency. The release pipeline reads
+// the same files directly to bundle them into per-target tarballs (so a
+// cross-compiled binary that can't execute on the build host still ships
+// with the correct unit/plist).
+const SYSTEMD_TEMPLATE: &str = include_str!("../share/doormand.service.in");
+const LAUNCHD_TEMPLATE: &str = include_str!("../share/com.doorman.doormand.plist.in");
+
+fn print_systemd_unit(bin: &str) {
+    println!("# systemd unit (write to /etc/systemd/system/doormand.service):");
+    print!("{}", SYSTEMD_TEMPLATE.replace("__BIN_PATH__", bin));
+}
+
+fn print_launchd_plist(bin: &str) {
+    println!("<!-- launchd plist (write to /Library/LaunchDaemons/com.doorman.doormand.plist, owner root:wheel, mode 0644) -->");
+    print!("{}", LAUNCHD_TEMPLATE.replace("__BIN_PATH__", bin));
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {

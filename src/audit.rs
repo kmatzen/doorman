@@ -20,8 +20,6 @@ use time::OffsetDateTime;
 #[derive(Debug, Serialize)]
 pub struct Record<'a> {
     pub ts: String,
-    pub pid: i64,
-    pub uid: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cred: Option<&'a str>,
     pub host: &'a str,

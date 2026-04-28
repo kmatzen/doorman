@@ -1,0 +1,130 @@
+name: release
+
+# Triggered when a `v*` tag is pushed. Cross-compiles the release binary for
+# each supported target, packages it with docs and the right service file,
+# and attaches the tarballs to a GitHub release.
+#
+#   git tag v0.1.0 && git push --tags
+#
+# To re-run for an existing tag, delete the tag locally and on the remote,
+# then push again.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The path the tarball's service file embeds. Must match what the install
+  # docs tell operators to use.
+  INSTALL_AS: /usr/local/bin/doormand
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools (linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross (linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross --tag v0.2.5
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Strip
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/doormand"
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-musl)
+              # cross produces a stripped binary already; nothing to do.
+              ;;
+            *-apple-darwin)
+              strip "${BIN}" || true
+              ;;
+            *)
+              strip "${BIN}" || true
+              ;;
+          esac
+
+      - name: Bundle
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="doorman-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/doormand" "dist/${NAME}/"
+          cp README.md plan.md "dist/${NAME}/"
+          cp -r examples "dist/${NAME}/"
+          if [[ "${{ matrix.target }}" == *darwin* ]]; then
+            sed "s|__BIN_PATH__|${INSTALL_AS}|g" share/com.doorman.doormand.plist.in \
+              > "dist/${NAME}/com.doorman.doormand.plist"
+          else
+            sed "s|__BIN_PATH__|${INSTALL_AS}|g" share/doormand.service.in \
+              > "dist/${NAME}/doormand.service"
+          fi
+          (cd dist && tar -czf "${NAME}.tar.gz" "${NAME}")
+          ls -lh "dist/${NAME}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -lh dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
