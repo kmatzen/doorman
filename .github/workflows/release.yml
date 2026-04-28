@@ -92,7 +92,7 @@ jobs:
           NAME="doorman-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
           cp "target/${{ matrix.target }}/release/doormand" "dist/${NAME}/"
-          cp README.md plan.md "dist/${NAME}/"
+          cp README.md "dist/${NAME}/"
           cp -r examples "dist/${NAME}/"
           if [[ "${{ matrix.target }}" == *darwin* ]]; then
             sed "s|__BIN_PATH__|${INSTALL_AS}|g" share/com.doorman.doormand.plist.in \

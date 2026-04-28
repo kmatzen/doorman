@@ -17,7 +17,7 @@ release: clean-dist
 	@mkdir -p $(DIST)
 	cp target/release/doormand $(DIST)/
 	-strip $(DIST)/doormand 2>/dev/null || true
-	cp README.md plan.md $(DIST)/
+	cp README.md $(DIST)/
 	cp -r examples $(DIST)/
 	@if echo "$(TARGET)" | grep -q darwin; then \
 		sed "s|__BIN_PATH__|$(INSTALL_AS)|g" share/com.doorman.doormand.plist.in > $(DIST)/com.doorman.doormand.plist; \
