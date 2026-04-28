@@ -10,11 +10,10 @@ name = "doormand"
 path = "src/main.rs"
 
 # The spec lists tokio/hyper/rustls/serde/serde_yaml as the dependencies. The
-# remaining entries are unavoidable bridges between those (tokio-rustls,
-# hyper-util, http-body-util) or implementations of features the spec
-# explicitly demands (rcgen for on-the-fly leaf cert minting, serde_json for
-# the audit log, time for RFC3339 timestamps). No reqwest, no async-trait
-# gymnastics, no plugin loader.
+# rest are unavoidable bridges (tokio-rustls, hyper-util, http-body,
+# http-body-util) or implementations of features the spec demands
+# (webpki-roots for upstream trust, serde_json for the audit log, time for
+# RFC3339). No reqwest, no async-trait gymnastics, no plugin loader.
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "signal", "sync", "time"] }
 hyper = { version = "1", features = ["server", "client", "http1"] }
@@ -23,9 +22,7 @@ http-body = "1"
 http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-rustls-pemfile = "2"
 webpki-roots = "0.26"
-rcgen = { version = "0.13", features = ["x509-parser"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"

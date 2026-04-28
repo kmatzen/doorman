@@ -1,8 +1,10 @@
 # doorman
 
-An HTTPS proxy that holds your API keys and refuses to send them anywhere they don't belong.
+An HTTP proxy that holds your API keys and refuses to send them anywhere they don't belong.
 
 The agent process never sees the secret. It addresses credentials by name (`{{github}}`); doorman substitutes the real value into the outgoing request, but only if the destination host is on the allowlist for that credential. Every request is logged.
+
+The agent talks to doorman over plaintext HTTP on loopback. Doorman talks to the upstream over TLS. There is no CA to install, no `HTTPS_PROXY` ceremony, no per-host cert minting — just a forward HTTP proxy that holds secrets.
 
 This is the entire product. See [plan.md](plan.md) for the design rationale and the explicit list of non-goals.
 
@@ -14,14 +16,6 @@ Build from source:
 cargo build --release
 sudo install -m 0755 target/release/doormand /usr/local/bin/doormand
 ```
-
-Generate a CA the first time:
-
-```
-sudo doormand init --state-dir /etc/doorman
-```
-
-This writes `/etc/doorman/ca.crt` (world-readable, what the agent trusts) and `/etc/doorman/ca.key` (mode 0400, what doorman signs leaf certs with). Add the cert to the agent's trust store — for most CLI tools `export SSL_CERT_FILE=/etc/doorman/ca.crt` is enough.
 
 Write `/etc/doorman/doorman.yaml` (mode 0400) — see [Config](#config) below.
 
@@ -37,7 +31,6 @@ Or run it directly for development:
 ```
 doormand run \
   --config ./doorman.yaml \
-  --state-dir /tmp/doorman-state \
   --audit /tmp/doorman.audit \
   --listen 127.0.0.1:18443 \
   --insecure-skip-mode-check
@@ -45,17 +38,18 @@ doormand run \
 
 ## Use
 
-Point the agent at the proxy and trust the CA:
+Point the agent at the proxy:
 
 ```
-export HTTPS_PROXY=http://127.0.0.1:8443
-export SSL_CERT_FILE=/etc/doorman/ca.crt
+export HTTP_PROXY=http://127.0.0.1:8443
 ```
 
-In requests, refer to the credential by name with a `{{name}}` placeholder in any header. The placeholder header itself is dropped before the request goes upstream — only the templated `inject` header reaches the destination.
+In agent code, use `http://` URLs even though the upstream is HTTPS — doorman upgrades to TLS for the upstream connection. Refer to credentials by name with a `{{name}}` placeholder in any header. The placeholder header itself is dropped before the request goes upstream — only the templated `inject` header reaches the destination.
 
 ```
-curl -H 'X-Cred: {{github}}' https://api.github.com/repos/acme/widgets/issues
+curl --proxy http://127.0.0.1:8443 \
+     -H 'X-Cred: {{github}}' \
+     http://api.github.com/repos/acme/widgets/issues
 ```
 
 There must be exactly one placeholder in the request. Zero is denied (no credential to use). More than one is denied (ambiguous).
@@ -94,8 +88,6 @@ One JSON line per request, fsync'd. Default path `/var/log/doorman/audit.log`, m
 {"ts":"2026-04-27T14:22:01Z","pid":-1,"uid":-1,"cred":"github","host":"api.github.com","method":"GET","path":"/repos/acme/widgets/issues","status":200,"bytes_in":0,"bytes_out":8421,"ms":234,"decision":"allow"}
 ```
 
-Fields:
-
 | field | meaning |
 | --- | --- |
 | `ts` | RFC 3339 UTC timestamp at request completion |
@@ -127,12 +119,15 @@ What doorman does NOT guarantee:
 2. That an upstream API doesn't echo your token back in a body. (Headers, yes — `Set-Cookie` and `WWW-Authenticate` are stripped. Response bodies are not scrubbed.)
 3. That a kernel exploit, sandbox escape, or compromise of the doorman binary itself doesn't defeat everything.
 4. That the agent can't enumerate what's allowed by trial and error.
+5. That a third party who can reach doorman's listening port can't issue requests as the agent. Pin the listener to loopback or a netns the agent shares; nothing more clever than that.
 
 ## Limitations
 
-- **`pid` and `uid` are hardcoded to `-1`.** SO_PEERCRED works on Unix sockets, not TCP. The TCP listener is what the spec specifies, so audit lines don't carry real peer credentials. If you have multiple uids on the host that can reach `127.0.0.1:8443`, you can't tell them apart in the log.
+- **`pid` and `uid` are hardcoded to `-1`.** TCP sockets don't carry peer credentials the way Unix sockets do. If multiple uids on the host can reach the proxy port, you can't tell them apart in the log.
 - **Audit gaps on the allow path.** Audit writes for allowed requests happen at end-of-stream. If an audit write fails mid-day (disk full, etc.), the agent has already received the response — we log the failure to stderr and keep serving. Deny-path audit is still pre-response and hard fails closed.
-- **No HTTP/2.** Only HTTP/1.1 inside the tunnel and to the upstream.
+- **Agent must use `http://` URLs.** Even though the upstream is HTTPS, the agent addresses doorman with `http://` scheme. This trades familiarity for a much smaller proxy.
+- **Upstream port is always 443.** The URI port (if any) is ignored. Add a `port` field to the config if you need something else.
+- **No HTTP/2.** Only HTTP/1.1, on both sides.
 - **No connection pooling.** One TLS handshake per upstream request. Boring is good; this is a known cost.
 - **No config hot-reload.** Restart the service to pick up changes. Restarts are sub-second.
 - **No launchd plist.** `install-service` only emits the systemd unit. macOS users need to write the plist themselves.
@@ -141,12 +136,10 @@ What doorman does NOT guarantee:
 ## Layout
 
 ```
-src/main.rs       CLI dispatch (init / install-service / run)
+src/main.rs       CLI dispatch (install-service / run)
 src/config.rs     YAML loader for /etc/doorman/doorman.yaml
-src/ca.rs         CA generation and per-host leaf cert minting
 src/audit.rs      JSON-line audit writer, fsync per record
-src/proxy.rs      CONNECT handling, TLS interception, header rewrite,
-                  upstream forwarding, body streaming
+src/proxy.rs      HTTP/1.1 server, header rewrite, upstream TLS, body streaming
 ```
 
-About 1300 lines total.
+About 1100 lines total.

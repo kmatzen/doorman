@@ -1,24 +1,26 @@
-// The proxy core. Listens on the configured TCP port, handles `CONNECT`,
-// performs TLS interception with a per-host minted leaf cert, scans the inner
-// request for a `{{name}}` placeholder, applies the inject template, and
-// forwards to the upstream over a fresh TLS connection.
+// The proxy core. Plain HTTP/1.1 forward proxy: agents speak plaintext to
+// doorman, doorman speaks TLS to the upstream. The agent's request URI may
+// be in absolute form (`GET http://api.github.com/path HTTP/1.1`) or in
+// origin form with a `Host:` header — both are accepted.
 //
-// Bodies stream through in both directions; doorman never buffers the
-// payload. A small `Counting` body adapter wraps each direction so the audit
-// log still gets accurate byte counts. The audit line for an allowed request
-// is written when the response body finishes streaming to the agent (or, if
-// the agent disconnects mid-stream, when the body wrapper is dropped).
+// Request flow:
+//   - extract upstream host (from URI authority or `Host` header)
+//   - locate the `{{name}}` placeholder in some request header
+//   - look up the credential, validate host and method against the policy
+//   - drop the placeholder header and any hop-by-hop headers; inject the
+//     templated auth header per the credential's `inject` template
+//   - TLS-connect to the upstream on port 443; stream the request body
+//     through; stream the response body back; strip `Set-Cookie` and
+//     `WWW-Authenticate` from the response
+//   - write one audit-log line at end-of-stream (or on drop)
 //
-// Things this module deliberately does NOT do, per spec §"How it works" and
-// §"What I'd cut":
-//   - follow redirects (3xx is returned to the agent verbatim)
-//   - do anything with HTTP/2 (we negotiate http/1.1 only)
-//   - cache or pool upstream connections (one TLS handshake per request;
-//     boring is good)
-//
-// The one piece of clever response-side handling: stripping `Set-Cookie` and
-// `WWW-Authenticate` from the response on the way back, because some
-// upstreams reflect auth material in those.
+// What this module deliberately does NOT do:
+//   - terminate TLS on the agent side (no CA, no per-host leaf certs)
+//   - support HTTPS_PROXY / `CONNECT` (the agent must use HTTP_PROXY and
+//     `http://` URLs)
+//   - follow redirects (3xx returned to the agent verbatim)
+//   - HTTP/2 (HTTP/1.1 only, on both sides)
+//   - cache or pool upstream connections (one TLS handshake per request)
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -38,30 +40,28 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
 
 use crate::audit::{self, Audit, Record};
-use crate::ca::Ca;
 use crate::config::Config;
 
 /// Headers stripped from every upstream response before it goes back to the
-/// agent. The spec singles these out because some upstreams put session
-/// material in them on auth errors.
+/// agent. Some upstreams put session material in these on auth errors.
 const STRIPPED_RESPONSE_HEADERS: &[&str] = &["set-cookie", "www-authenticate"];
 
-/// Held by every connection handler. Cheap to clone (everything is Arc).
+/// Always-on TLS port for the upstream. The agent's URI port (if any) is
+/// ignored; an MVP that talks to "real" APIs only ever needs 443. If you
+/// need a different port per credential, add it to the config later.
+const UPSTREAM_TLS_PORT: u16 = 443;
+
 #[derive(Clone)]
 pub struct Server {
     pub config: Arc<Config>,
-    pub ca: Arc<Ca>,
     pub audit: Arc<Audit>,
     pub upstream_tls: Arc<rustls::ClientConfig>,
 }
 
-/// Unified outgoing-body type. Lets `serve` return either a streamed upstream
-/// body or a small synchronous deny payload through the same signature.
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, DynErr>;
 
@@ -69,7 +69,7 @@ pub async fn run(server: Server, listen: SocketAddr) -> Result<(), String> {
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|e| format!("bind {}: {}", listen, e))?;
-    eprintln!("doorman listening on {}", listen);
+    eprintln!("doorman listening on {} (plain HTTP forward proxy)", listen);
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -80,137 +80,39 @@ pub async fn run(server: Server, listen: SocketAddr) -> Result<(), String> {
         };
         let s = server.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(s, stream, peer_addr).await {
+            if let Err(e) = handle_connection(s, stream).await {
                 eprintln!("connection {}: {}", peer_addr, e);
             }
         });
     }
 }
 
-/// Read the agent's `CONNECT host:port HTTP/1.1` line, ack it, and hand the
-/// underlying socket to the TLS-MITM path. Anything other than CONNECT gets a
-/// 405 and the connection is closed; this proxy is HTTPS-only by design.
-async fn handle_connection(
-    server: Server,
-    mut stream: TcpStream,
-    _peer_addr: SocketAddr,
-) -> Result<(), String> {
-    let target = match read_connect_line(&mut stream).await? {
-        Some(t) => t,
-        None => {
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            return Ok(());
-        }
-    };
-
-    stream
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await
-        .map_err(|e| format!("ack CONNECT: {}", e))?;
-
-    let acceptor = TlsAcceptor::from(server.ca.server_config_for(&target.host)?);
-    let tls = match acceptor.accept(stream).await {
-        Ok(t) => t,
-        Err(e) => return Err(format!("tls accept for {}: {}", target.host, e)),
-    };
-
-    let svc_target = Arc::new(target.clone());
-    let svc_server = server.clone();
+async fn handle_connection(server: Server, stream: TcpStream) -> Result<(), String> {
     let svc = service_fn(move |req: Request<Incoming>| {
-        let server = svc_server.clone();
-        let target = Arc::clone(&svc_target);
-        async move { Ok::<_, Infallible>(serve(server, target, req).await) }
+        let server = server.clone();
+        async move { Ok::<_, Infallible>(serve(server, req).await) }
     });
-
-    if let Err(e) = server_http1::Builder::new()
-        .serve_connection(TokioIo::new(tls), svc)
+    server_http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), svc)
         .await
-    {
-        // Clients drop connections all the time; demoted to a one-line note.
-        eprintln!("inner http1 for {}: {}", target.host, e);
-    }
-    Ok(())
+        .map_err(|e| format!("h1: {}", e))
 }
 
-#[derive(Clone, Debug)]
-struct Target {
-    host: String,
-    port: u16,
-}
-
-/// Pull the request line and headers off the wire and parse just enough to
-/// confirm this is a `CONNECT host:port` and extract the target. Returns
-/// `Ok(None)` if the method isn't CONNECT (caller should reject).
-async fn read_connect_line(stream: &mut TcpStream) -> Result<Option<Target>, String> {
-    let mut buf = [0u8; 8192];
-    let mut n = 0;
-    let header_end = loop {
-        if n == buf.len() {
-            return Err("CONNECT preamble too large".into());
-        }
-        let r = stream
-            .read(&mut buf[n..])
-            .await
-            .map_err(|e| format!("read CONNECT: {}", e))?;
-        if r == 0 {
-            return Err("client closed before CONNECT".into());
-        }
-        n += r;
-        if let Some(idx) = find_double_crlf(&buf[..n]) {
-            break idx;
-        }
-    };
-
-    let raw = std::str::from_utf8(&buf[..header_end])
-        .map_err(|_| "non-UTF8 CONNECT preamble".to_string())?;
-    let first_line = raw.lines().next().ok_or("empty CONNECT preamble")?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().ok_or("malformed request line")?;
-    let target = parts.next().ok_or("malformed request line")?;
-    let _version = parts.next().ok_or("malformed request line")?;
-    if !method.eq_ignore_ascii_case("CONNECT") {
-        return Ok(None);
-    }
-    let (host, port) = parse_host_port(target)?;
-    Ok(Some(Target {
-        host: host.to_ascii_lowercase(),
-        port,
-    }))
-}
-
-fn parse_host_port(s: &str) -> Result<(String, u16), String> {
-    if let Some(idx) = s.rfind(':') {
-        // IPv6 literals are wrapped in [], we don't bother supporting them.
-        let host = &s[..idx];
-        let port = s[idx + 1..]
-            .parse::<u16>()
-            .map_err(|_| format!("bad port in {:?}", s))?;
-        if host.is_empty() {
-            return Err(format!("empty host in {:?}", s));
-        }
-        Ok((host.to_string(), port))
-    } else {
-        Err(format!("CONNECT target {:?} has no port", s))
-    }
-}
-
-fn find_double_crlf(b: &[u8]) -> Option<usize> {
-    b.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-/// One inner HTTP request. Returns whatever response the agent should see —
-/// either a 4xx from doorman, or the (filtered) upstream response, streamed.
-async fn serve(
-    server: Server,
-    target: Arc<Target>,
-    req: Request<Incoming>,
-) -> Response<ProxyBody> {
+/// One inbound HTTP request from the agent. Returns either a doorman 4xx/5xx
+/// or the streamed upstream response.
+async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
     let started = Instant::now();
     let method = req.method().clone();
+
+    // Resolve target host: prefer the URI authority (absolute-form requests
+    // sent to a forward proxy) and fall back to the `Host` header.
+    let target_host = match resolve_target_host(&req) {
+        Some(h) => h,
+        None => {
+            return deny_no_target(&server, &method, started);
+        }
+    };
+
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -219,14 +121,12 @@ async fn serve(
 
     let (mut parts, body) = req.into_parts();
 
-    // Find the credential placeholder in the headers. We do this before
-    // reading any body bytes so the deny path stays cheap.
     let (cred_name, placeholder_header) = match find_placeholder(&parts.headers) {
         Ok(v) => v,
         Err(reason) => {
             return deny(
                 &server,
-                &target,
+                &target_host,
                 method.as_str(),
                 &path_and_query,
                 None,
@@ -242,7 +142,7 @@ async fn serve(
         None => {
             return deny(
                 &server,
-                &target,
+                &target_host,
                 method.as_str(),
                 &path_and_query,
                 Some(&cred_name),
@@ -253,10 +153,10 @@ async fn serve(
         }
     };
 
-    if !entry.host_allowed(&target.host) {
+    if !entry.host_allowed(&target_host) {
         return deny(
             &server,
-            &target,
+            &target_host,
             method.as_str(),
             &path_and_query,
             Some(&cred_name),
@@ -268,7 +168,7 @@ async fn serve(
     if !entry.method_allowed(method.as_str()) {
         return deny(
             &server,
-            &target,
+            &target_host,
             method.as_str(),
             &path_and_query,
             Some(&cred_name),
@@ -278,10 +178,10 @@ async fn serve(
         );
     }
 
-    // Rewrite headers in place: drop the agent's placeholder header (whatever
-    // surrounding text it had is ignored — interpretation B), drop hop-by-hop
-    // and length-shaped headers (hyper computes them from the body), then
-    // inject the templated auth header and set Host.
+    // Rewrite headers: drop the placeholder header (its surrounding text is
+    // ignored — interpretation B), drop hop-by-hop and length-shaped headers
+    // (hyper computes them from the body), inject the templated auth header,
+    // and set Host to the canonical target.
     parts.headers.remove(&placeholder_header);
     for h in [
         "proxy-connection",
@@ -291,18 +191,34 @@ async fn serve(
     ] {
         parts.headers.remove(h);
     }
-    let inject_name = HeaderName::try_from(entry.header_name.as_str())
-        .expect("validated at config load");
-    let inject_value = HeaderValue::try_from(entry.render())
-        .expect("validated at config load");
+    let inject_name =
+        HeaderName::try_from(entry.header_name.as_str()).expect("validated at config load");
+    let inject_value =
+        HeaderValue::try_from(entry.render()).expect("validated at config load");
     parts.headers.insert(inject_name, inject_value);
     parts.headers.insert(
         HOST,
-        HeaderValue::try_from(target.host.as_str()).expect("host header"),
+        HeaderValue::try_from(target_host.as_str()).expect("host header"),
     );
 
-    // Wrap the agent's request body so we count bytes as the upstream client
-    // pulls them through; no buffering.
+    // Force the outgoing URI to origin-form. Upstream HTTP/1.1 origin servers
+    // expect `GET /path HTTP/1.1`, not `GET https://host/path HTTP/1.1`.
+    parts.uri = match path_and_query.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return deny(
+                &server,
+                &target_host,
+                method.as_str(),
+                &path_and_query,
+                Some(&cred_name),
+                StatusCode::BAD_REQUEST,
+                Some("invalid request path"),
+                started,
+            );
+        }
+    };
+
     let bytes_in_counter = Arc::new(AtomicU64::new(0));
     let req_body = Counting {
         inner: body,
@@ -311,12 +227,12 @@ async fn serve(
     };
     let upstream_req = Request::from_parts(parts, req_body);
 
-    let upstream_response = match send_upstream(&server, &target, upstream_req).await {
+    let upstream_response = match send_upstream(&server, &target_host, upstream_req).await {
         Ok(r) => r,
         Err(e) => {
             return deny(
                 &server,
-                &target,
+                &target_host,
                 method.as_str(),
                 &path_and_query,
                 Some(&cred_name),
@@ -334,16 +250,12 @@ async fn serve(
     }
     let status = resp_parts.status;
 
-    // Wrap the upstream's response body so we count outbound bytes as hyper
-    // streams them to the agent. The on_end callback writes one audit line
-    // when the body is fully consumed (or the wrapper is dropped because the
-    // agent went away).
     let bytes_out_counter = Arc::new(AtomicU64::new(0));
     let on_end = build_audit_callback(AuditCtx {
         audit: Arc::clone(&server.audit),
         started,
         cred: cred_name,
-        host: target.host.clone(),
+        host: target_host,
         method: method.as_str().to_string(),
         path: path_and_query,
         status: status.as_u16(),
@@ -361,6 +273,20 @@ async fn serve(
         *h = out_headers;
     }
     resp.body(resp_body.boxed()).expect("response build")
+}
+
+/// Pull the upstream host out of an absolute-form URI authority, or fall
+/// back to the `Host` header. Strips any port. Lowercased.
+fn resolve_target_host(req: &Request<Incoming>) -> Option<String> {
+    if let Some(host) = req.uri().host() {
+        return Some(host.to_ascii_lowercase());
+    }
+    let host_hdr = req.headers().get(HOST)?.to_str().ok()?;
+    let bare = host_hdr.split(':').next().unwrap_or(host_hdr).trim();
+    if bare.is_empty() {
+        return None;
+    }
+    Some(bare.to_ascii_lowercase())
 }
 
 /// Locate the unique header value containing exactly one `{{name}}`
@@ -399,7 +325,7 @@ fn find_placeholder(headers: &hyper::HeaderMap) -> Result<(String, HeaderName), 
 
 async fn send_upstream<B>(
     server: &Server,
-    target: &Target,
+    target_host: &str,
     req: Request<B>,
 ) -> Result<Response<Incoming>, String>
 where
@@ -407,12 +333,12 @@ where
     B::Data: Send,
     B::Error: Into<DynErr>,
 {
-    let addr = format!("{}:{}", target.host, target.port);
+    let addr = format!("{}:{}", target_host, UPSTREAM_TLS_PORT);
     let tcp = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("dial {}: {}", addr, e))?;
-    let server_name: ServerName<'static> = ServerName::try_from(target.host.clone())
-        .map_err(|e| format!("server name {:?}: {}", target.host, e))?;
+    let server_name: ServerName<'static> = ServerName::try_from(target_host.to_string())
+        .map_err(|e| format!("server name {:?}: {}", target_host, e))?;
     let connector = TlsConnector::from(Arc::clone(&server.upstream_tls));
     let tls = connector
         .connect(server_name, tcp)
@@ -430,10 +356,29 @@ where
         .map_err(|e| format!("send: {}", e))
 }
 
+/// Special-case deny for "we couldn't even figure out where this request was
+/// going" — neither absolute-form URI nor Host header.
+fn deny_no_target(
+    server: &Server,
+    method: &hyper::Method,
+    started: Instant,
+) -> Response<ProxyBody> {
+    deny(
+        server,
+        "<unknown>",
+        method.as_str(),
+        "<unknown>",
+        None,
+        StatusCode::BAD_REQUEST,
+        Some("no target host (need absolute-form URI or Host header)"),
+        started,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn deny(
     server: &Server,
-    target: &Target,
+    target_host: &str,
     method: &str,
     path: &str,
     cred: Option<&str>,
@@ -453,12 +398,10 @@ fn deny(
         pid: -1,
         uid: -1,
         cred,
-        host: &target.host,
+        host: target_host,
         method,
         path,
         status: status.as_u16(),
-        // We never read the request body on a deny — counting it here would
-        // mean draining bytes from the agent that we're about to refuse.
         bytes_in: 0,
         bytes_out,
         ms: started.elapsed().as_millis() as u64,
@@ -568,8 +511,6 @@ impl<B> Drop for Counting<B> {
     }
 }
 
-/// Owned context an end-of-stream callback needs to write the audit line.
-/// Pulled out so the closure isn't a wall of captures.
 struct AuditCtx {
     audit: Arc<Audit>,
     started: Instant,
