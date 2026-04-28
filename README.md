@@ -57,7 +57,7 @@ Verify before installing:
 ```
 # Provenance: confirms the tarball was built by this repo's release workflow.
 # Requires gh ≥ 2.49.
-gh attestation verify doorman-0.1.0-aarch64-apple-darwin.tar.gz \
+gh attestation verify doorman-<version>-<target>.tar.gz \
   --repo kmatzen/doorman
 
 # Integrity only (no provenance, but no gh required):
@@ -67,8 +67,8 @@ sha256sum -c SHA256SUMS --ignore-missing
 Then install:
 
 ```
-tar -xzf doorman-0.1.0-aarch64-apple-darwin.tar.gz
-cd doorman-0.1.0-aarch64-apple-darwin
+tar -xzf doorman-<version>-<target>.tar.gz
+cd doorman-<version>-<target>
 sudo install -m 0755 doormand /usr/local/bin/doormand
 ```
 
