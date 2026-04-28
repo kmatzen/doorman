@@ -50,6 +50,10 @@ use crate::config::Config;
 /// agent. Some upstreams put session material in these on auth errors.
 const STRIPPED_RESPONSE_HEADERS: &[&str] = &["set-cookie", "www-authenticate"];
 
+/// Header the agent sets to name the credential it wants doorman to inject.
+/// Doorman strips this header from the request before forwarding upstream.
+const CRED_HEADER: &str = "x-doorman-cred";
+
 /// Always-on TLS port for the upstream. The agent's URI port (if any) is
 /// ignored; an MVP that talks to "real" APIs only ever needs 443. If you
 /// need a different port per credential, add it to the config later.
@@ -121,7 +125,7 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
 
     let (mut parts, body) = req.into_parts();
 
-    let (cred_name, placeholder_header) = match find_placeholder(&parts.headers) {
+    let cred_name = match find_credential(&parts.headers) {
         Ok(v) => v,
         Err(reason) => {
             return deny(
@@ -178,11 +182,11 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
         );
     }
 
-    // Rewrite headers: drop the placeholder header (its surrounding text is
-    // ignored — interpretation B), drop hop-by-hop and length-shaped headers
-    // (hyper computes them from the body), inject the templated auth header,
-    // and set Host to the canonical target.
-    parts.headers.remove(&placeholder_header);
+    // Rewrite headers: drop the cred-name header (it's a doorman-internal
+    // signal and must not leak upstream), drop hop-by-hop and length-shaped
+    // headers (hyper computes them from the body), inject the templated auth
+    // header, and set Host to the canonical target.
+    parts.headers.remove(CRED_HEADER);
     for h in [
         "proxy-connection",
         "proxy-authorization",
@@ -289,38 +293,22 @@ fn resolve_target_host(req: &Request<Incoming>) -> Option<String> {
     Some(bare.to_ascii_lowercase())
 }
 
-/// Locate the unique header value containing exactly one `{{name}}`
-/// placeholder. Multiple placeholders, or none, is a deny.
-fn find_placeholder(headers: &hyper::HeaderMap) -> Result<(String, HeaderName), &'static str> {
-    let mut found: Option<(String, HeaderName)> = None;
-    for (name, value) in headers.iter() {
-        let v = match value.to_str() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let count = v.matches("{{").count();
-        if count == 0 {
-            continue;
-        }
-        if count > 1 {
-            return Err("multiple placeholders in one header");
-        }
-        let Some(start) = v.find("{{") else {
-            continue;
-        };
-        let Some(end_rel) = v[start + 2..].find("}}") else {
-            return Err("malformed placeholder (missing '}}')");
-        };
-        let cred = v[start + 2..start + 2 + end_rel].trim();
-        if cred.is_empty() {
-            return Err("empty placeholder name");
-        }
-        if found.is_some() {
-            return Err("multiple placeholders across headers");
-        }
-        found = Some((cred.to_string(), name.clone()));
+/// Look up the agent's credential selection — the `X-Doorman-Cred` header.
+/// Exactly one such header must be present and non-empty.
+fn find_credential(headers: &hyper::HeaderMap) -> Result<String, &'static str> {
+    let mut iter = headers.get_all(CRED_HEADER).iter();
+    let first = iter.next().ok_or("missing X-Doorman-Cred header")?;
+    if iter.next().is_some() {
+        return Err("multiple X-Doorman-Cred headers");
     }
-    found.ok_or("no credential placeholder in any header")
+    let s = first
+        .to_str()
+        .map_err(|_| "X-Doorman-Cred contains non-ASCII")?
+        .trim();
+    if s.is_empty() {
+        return Err("empty X-Doorman-Cred value");
+    }
+    Ok(s.to_string())
 }
 
 async fn send_upstream<B>(

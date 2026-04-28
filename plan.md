@@ -47,7 +47,7 @@ One file, `/etc/doorman/doorman.yaml`, mode `0400`, owned by the doorman uid:
   methods: [GET]
 ```
 
-Five fields. `name` is the placeholder the agent uses (`{{github}}`). `secret` is the string. `inject` is the header template. `hosts` is the allowlist. `methods` is optional and defaults to all.
+Five fields. `name` is what the agent puts in `X-Doorman-Cred` to select this credential. `secret` is the string. `inject` is the header template doorman writes on the outgoing request. `hosts` is the allowlist. `methods` is optional and defaults to all.
 
 That's the whole config language. No conditionals, no templating beyond `{}`, no includes, no environments. If you need two scopes for the same secret, you write two entries.
 
@@ -58,7 +58,7 @@ Agent sets `HTTP_PROXY=http://127.0.0.1:8443`. Agent writes a request like:
 ```
 GET http://api.github.com/repos/acme/widgets/issues HTTP/1.1
 Host: api.github.com
-X-Cred: {{github}}
+X-Doorman-Cred: github
 ```
 
 (Either absolute-form URI or origin-form with a `Host` header is fine; doorman accepts both. The agent uses the `http://` scheme — the actual HTTPS upgrade happens on the upstream side.)
@@ -66,10 +66,10 @@ X-Cred: {{github}}
 Doorman:
 
 1. Resolves the upstream host from the URI authority or the `Host` header. No host → 400, log, drop.
-2. Finds the placeholder `{{github}}`. Looks up `github` in the config. Not found → 403, log, drop.
+2. Reads the `X-Doorman-Cred` header (must be present, exactly one, non-empty). Looks up the named credential in the config. Not found → 403, log, drop.
 3. Checks resolved host against the credential's `hosts`. Not allowed → 403, log, drop.
 4. Checks method against `methods`. Not allowed → 403, log, drop.
-5. Drops the placeholder header (its surrounding text is ignored — the inject template is the sole source of the auth header that goes upstream). Drops hop-by-hop headers. Inserts the templated header (`Authorization: Bearer ghp_xxxxxxxxxxxx`).
+5. Drops the `X-Doorman-Cred` header (it must not leak upstream). Drops hop-by-hop headers. Inserts the templated header (`Authorization: Bearer ghp_xxxxxxxxxxxx`), overwriting any auth header the agent set.
 6. TLS-connects to the upstream on port 443 and forwards the request, body streamed.
 7. Returns the response, body streamed back. Strips `Set-Cookie` and `WWW-Authenticate` from the response.
 8. Appends one line to the audit log when the response body finishes streaming.

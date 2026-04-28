@@ -6,7 +6,7 @@ An HTTP proxy that holds your API keys and refuses to send them anywhere they do
 
 You're running an agent — an LLM, a script, a job runner, anything that takes instructions from somewhere you don't fully trust and then makes API calls. If you ship that agent the literal value of `GITHUB_TOKEN`, then any prompt injection, any malicious tool output, any rogue dependency in the agent's process can read it out of memory or env. The blast radius is "every API the token can reach, forever, until you rotate it."
 
-Doorman holds the secret in a different process under a different uid. The agent never sees the value — it refers to the credential by name (`{{github}}`) when it makes a request. Doorman validates the destination against a per-credential allowlist, substitutes the real secret into the outgoing header, forwards the request, and writes one audit-log line. If the agent tries to send a GitHub token to `attacker.com`, doorman returns 403, logs the attempt, and the secret stays where it is.
+Doorman holds the secret in a different process under a different uid. The agent never sees the value — it names the credential it wants on each request (`X-Doorman-Cred: github`). Doorman validates the destination against a per-credential allowlist, sets the real auth header on the outgoing request, forwards it, and writes one audit-log line. If the agent tries to send a GitHub token to `attacker.com`, doorman returns 403, logs the attempt, and the secret stays where it is.
 
 The blast radius drops from "everything the token can do" to "everything the policy lets the token do on the hosts you allowlisted." The hostile-content paths into the agent are unchanged — what's changed is what they can reach.
 
@@ -30,9 +30,9 @@ The agent talks to doorman over plaintext HTTP on loopback. Doorman talks to the
 Per request, doorman:
 
 1. Resolves the upstream host from the URI authority or `Host` header.
-2. Finds the `{{name}}` placeholder in some request header.
-3. Looks up the credential. Validates the host and method against the policy.
-4. Drops the placeholder header. Drops hop-by-hop headers. Inserts the templated auth header (e.g. `Authorization: Bearer <secret>`).
+2. Reads the `X-Doorman-Cred` header to pick a credential.
+3. Looks up the credential in the config. Validates the host and method against its allowlist.
+4. Drops the `X-Doorman-Cred` header (it's a doorman-internal signal and must not leak upstream). Drops hop-by-hop headers. Inserts the templated auth header (e.g. `Authorization: Bearer <secret>`).
 5. TLS-connects to the upstream on port 443 and streams the request body through.
 6. Streams the response body back. Strips `Set-Cookie` and `WWW-Authenticate` from the response (some upstreams reflect auth material in those on errors).
 7. Appends one audit-log line at end of stream.
@@ -79,19 +79,19 @@ export HTTP_PROXY=http://127.0.0.1:8443
 
 In agent code, use `http://` URLs even when the upstream is HTTPS. Doorman receives the request in cleartext on loopback and upgrades to TLS for the upstream connection itself. Yes, the URL in your code looks "wrong" — that's the price of not having a CA.
 
-Refer to a credential by name with a `{{name}}` placeholder in any request header. Doorman drops that header (whatever surrounding text you put around the placeholder is ignored — only the credential's `inject` template defines what actually goes upstream).
+Pick a credential by setting `X-Doorman-Cred: <name>` on the request. Doorman strips that header before forwarding upstream and writes the templated auth header (per the credential's `inject` field) in its place.
 
 ```
 curl --proxy http://127.0.0.1:8443 \
-     -H 'X-Cred: {{github}}' \
+     -H 'X-Doorman-Cred: github' \
      http://api.github.com/repos/acme/widgets/issues
 ```
 
-A few rules that are easy to get wrong:
+Rules:
 
-- Exactly one placeholder per request. Zero is denied (no credential to use). More than one is denied (ambiguous).
-- The header you put the placeholder in doesn't matter — `X-Cred`, `Authorization`, `X-Whatever`. Doorman finds the `{{name}}` token, drops the carrier header, and writes the auth header from the credential's `inject` template.
-- The placeholder is `{{name}}` literally — no whitespace tricks, no nested braces, no Jinja-style filters.
+- Exactly one `X-Doorman-Cred` header per request. Zero or empty → denied (no credential to use). Multiple → denied (ambiguous).
+- The credential name must match an entry in the config exactly. The match is case-sensitive on the value; the header name itself follows HTTP's case-insensitive convention.
+- Doorman never lets the agent influence the auth header it writes. Whatever the agent puts in `Authorization`, doorman overwrites with the templated value.
 
 ## Config
 
@@ -119,7 +119,7 @@ A few rules that are easy to get wrong:
 
 Field-by-field:
 
-- **`name`** is what the agent puts inside `{{...}}`. Must be unique. ASCII alphanumeric plus `_`, `-`, `.`.
+- **`name`** is what the agent puts in `X-Doorman-Cred`. Must be unique. ASCII alphanumeric plus `_`, `-`, `.`.
 - **`secret`** is the literal string doorman substitutes. Doorman does nothing to interpret it — base64, JWT, opaque token, all the same.
 - **`inject`** is a header template like `Header-Name: prefix {} suffix`. Exactly one `{}` slot. Doorman writes this header on the outgoing request with `{}` replaced by the secret.
 - **`hosts`** is the upstream-host allowlist for this credential. Bare hostnames (no scheme, no port). The match is exact and case-insensitive.
