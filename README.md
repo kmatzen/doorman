@@ -55,7 +55,13 @@ less install.sh
 sh install.sh
 ```
 
-`DOORMAN_VERSION=v0.1.4` and `DOORMAN_PREFIX=$HOME/.local/bin` env vars override the release tag and install dir respectively.
+To override the version or install dir, place the env var on the **right** side of the pipe so it applies to `sh`, not `curl`:
+
+```
+curl -fsSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh | DOORMAN_PREFIX=$HOME/.local/bin sh
+```
+
+`DOORMAN_VERSION` defaults to the latest release tag; `DOORMAN_PREFIX` defaults to `/usr/local/bin`.
 
 ### From a release tarball
 
