@@ -136,10 +136,17 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/SHA256SUMS
+      - name: Stage install.sh
+        run: cp scripts/install.sh dist/install.sh && chmod +x dist/install.sh
+      - name: Attest install.sh
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/install.sh
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
+            dist/install.sh
           generate_release_notes: true
           fail_on_unmatched_files: true
