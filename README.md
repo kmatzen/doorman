@@ -32,7 +32,16 @@ Any deny is a 403 with a one-line JSON error body, plus an audit entry.
 
 ## Install
 
-### Quick install
+### Homebrew (macOS / Linux)
+
+```
+brew tap kmatzen/doorman
+brew install doorman
+```
+
+`brew info doorman` prints the config-file setup steps. Note: brew runs doorman under your user uid; for hardened production deployment with uid separation, use the systemd unit (Linux) or `install-darwin.sh` (macOS) — see [From a release tarball](#from-a-release-tarball) below.
+
+### Quick install (curl)
 
 ```
 curl -sSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh | sh
