@@ -1,0 +1,33 @@
+name: audit
+
+# Runs the RustSec advisory DB against doorman's dependency tree. Fires on
+# Cargo.{toml,lock} changes and once a day on cron, so a freshly-published
+# advisory surfaces here within 24h regardless of commit cadence.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/audit.yml'
+  schedule:
+    - cron: '0 12 * * *'
+
+permissions:
+  contents: read
+  issues: write   # the action opens an issue for advisories found on cron runs
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

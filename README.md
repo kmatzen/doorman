@@ -1,5 +1,8 @@
 # doorman
 
+[![ci](https://github.com/kmatzen/doorman/actions/workflows/ci.yml/badge.svg)](https://github.com/kmatzen/doorman/actions/workflows/ci.yml)
+[![audit](https://github.com/kmatzen/doorman/actions/workflows/audit.yml/badge.svg)](https://github.com/kmatzen/doorman/actions/workflows/audit.yml)
+
 An HTTP proxy that holds your API keys and refuses to send them anywhere they don't belong.
 
 The agent process never sees the secret value. It names the credential it wants on each request (`X-Doorman-Cred: github`); doorman validates the destination against a per-credential allowlist, sets the auth header on the outgoing request, forwards it, and writes one audit-log line. If the agent tries to send a GitHub token to `attacker.com`, doorman returns 403 and the secret stays where it is.
@@ -31,7 +34,21 @@ Any deny is a 403 with a one-line JSON error body, plus an audit entry.
 
 ### From a release tarball
 
-Each release ships per-platform tarballs (`doorman-<version>-<target>.tar.gz`) with the binary, the README, the example config, and the appropriate service file.
+Each release ships per-platform tarballs (`doorman-<version>-<target>.tar.gz`) with the binary, the README, the example config, and the appropriate service file. Releases starting with v0.1.3 also publish a `SHA256SUMS` file and a sigstore-signed build-provenance attestation for every artifact, recorded in the public Rekor transparency log.
+
+Verify before installing:
+
+```
+# Provenance: confirms the tarball was built by this repo's release workflow.
+# Requires gh ≥ 2.49.
+gh attestation verify doorman-0.1.0-aarch64-apple-darwin.tar.gz \
+  --repo kmatzen/doorman
+
+# Integrity only (no provenance, but no gh required):
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Then install:
 
 ```
 tar -xzf doorman-0.1.0-aarch64-apple-darwin.tar.gz
@@ -172,23 +189,46 @@ No bodies, no headers, no secrets.
 }
 ```
 
-## Security model
+## Using doorman with coding agents
 
-Guarantees:
+Doorman is designed for the case where an LLM agent generates and runs network calls during tool use — `curl`, generated Python, shell commands. The agent has full control over the request it constructs, so adding `--proxy` and `X-Doorman-Cred: <name>` is something it does on instruction.
 
-1. The agent's process never holds the secret in memory, env, filesystem, or any response from doorman.
-2. A secret is only ever sent to a host explicitly allowlisted for it.
-3. Every request — allow or deny — produces an audit-log line.
-4. With the systemd unit, doorman runs under a different uid from the agent, with `NoNewPrivileges`, no ambient capabilities, and `PR_SET_DUMPABLE=0`.
-5. The config file is readable only by the doorman uid.
+Two pieces have to be in place:
 
-Not guaranteed:
+1. **Tell the agent doorman exists.** Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the file your agent reads as system instructions (`CLAUDE.md` for Claude Code, `.cursorrules` for Cursor, an `--read` file for Aider). The instructions list available credential names, the proxy URL, and call patterns for `curl` / `httpx` / `undici`.
 
-1. That the agent uses its allowed access wisely. An allowed GitHub write can still open spam issues.
-2. That an upstream API doesn't echo a token in a response body. Doorman strips `Set-Cookie` and `WWW-Authenticate`; it doesn't scrub bodies.
-3. That a kernel exploit, sandbox escape, or doorman-binary compromise doesn't defeat everything.
-4. That the agent can't enumerate what's allowed by trial and error.
-5. That a third party who can reach doorman's listening port can't issue requests as the agent. Pin the listener to loopback or a netns the agent shares.
+2. **Confine egress so doorman is the only way out.** Doorman is an authorization boundary, not a network filter. An agent that ignores its instructions can call attacker.com directly unless the OS prevents it. Use a per-uid firewall rule, a network namespace, or a container network policy that blocks all outbound traffic except to doorman's listener. On Linux, the simplest form is an `iptables` egress rule scoped to the agent's uid; on macOS, `pf` rules; in containers, a network policy that whitelists only the proxy address.
+
+Without (2), the agent can bypass doorman. Without (1), it doesn't know how to use it. Both are required.
+
+## Threat model
+
+**The adversary is the agent process itself.** Doorman assumes the agent may be compromised, prompt-injected, or buggy: it can issue any HTTP request, name any credential, parse any response. Doorman's job is to make sure that adversary cannot exfiltrate a secret it never directly sees.
+
+**Assumed honest:** the host kernel, the doorman binary, the operator who wrote the config, and any process running as the doorman uid. If those are compromised, doorman cannot help.
+
+### In scope
+
+1. **Secret confidentiality from the agent.** The agent's process never holds the secret in memory, env, filesystem, or any response from doorman. It names credentials by label only.
+2. **Destination binding.** A secret is only ever sent to a host (and optionally method) explicitly allowlisted for it. Host comes from the request URI authority or `Host` header, lowercased, and exact-matched against the allowlist. Redirects are not followed; 3xx responses are returned to the agent verbatim.
+3. **Non-repudiation.** Every request — allow or deny — produces an audit-log line, fsync'd. Denies are logged before the response is sent; allows are logged at end-of-stream.
+4. **Process isolation.** With the systemd unit, doorman runs under a different uid from the agent, with `NoNewPrivileges`, no ambient capabilities, and `PR_SET_DUMPABLE=0` (no core dumps, no ptrace from same-uid processes).
+5. **Config confidentiality at rest.** The config file is mode 0400, owned by the doorman uid; doorman refuses to start otherwise (unless `--insecure-skip-mode-check`).
+
+### Out of scope
+
+1. **Misuse of legitimate access.** An allowed GitHub write can still open spam issues. Doorman is an authorization boundary, not a behavior monitor.
+2. **Upstream echo.** If an upstream API includes the bearer token in a response body, doorman forwards it. Doorman strips `Set-Cookie` and `WWW-Authenticate` from responses but does not scrub bodies.
+3. **Host compromise.** Kernel exploits, root, ptrace from a privileged uid, or a tampered doorman binary defeat everything. Verify release artifacts before installing.
+4. **Allowlist enumeration.** The agent can probe credential/host pairs and observe allow/deny. Treat the allowlist itself as non-secret.
+5. **Co-tenant processes.** Any process that can reach doorman's listening socket can issue requests as the agent. Pin the listener to loopback (default) and ensure only the agent uid can reach it.
+6. **Egress confinement.** Doorman does not prevent the agent from making direct network calls that bypass the proxy. An agent that ignores instructions can reach attacker.com itself unless the OS forbids it. The operator must enforce egress restriction at the OS level — per-uid firewall rule, network namespace, or container network policy — so doorman is the only outbound path.
+7. **Network adversaries past doorman.** Doorman validates upstream TLS against Mozilla's `webpki-roots`, statically linked at build time. It does not pin certificates and does not consult the system trust store.
+8. **Side channels.** Timing, response-size, and audit-volume side channels are not mitigated.
+
+### macOS deployments
+
+macOS's hardening primitives are weaker than systemd's. The `_doorman` user provides uid separation, but there is no equivalent of `NoNewPrivileges`, capability dropping, or `PR_SET_DUMPABLE=0`. Treat macOS as a development target; prefer Linux for production.
 
 ## Limitations
 
@@ -200,6 +240,22 @@ Not guaranteed:
 - **No upstream connection pooling.** One TLS handshake per upstream request, ~50ms cost.
 - **No config hot-reload.** Restart to pick up changes; restarts are sub-second. (`SIGHUP` reopens the audit log only.)
 - **`install-service` doesn't install.** It prints; you redirect.
+
+## Testing
+
+`cargo test` runs unit tests plus an integration suite (`tests/integration.rs`) that spins up doorman against a mock TLS upstream and exercises the full request path. Each branch of the security boundary has a named test:
+
+| Test | Boundary it covers |
+| --- | --- |
+| `allow_path_injects_secret_and_strips_cred_header` | Templated auth header is injected; `X-Doorman-Cred` is dropped before the request leaves doorman. |
+| `agent_authorization_header_is_overwritten` | An agent-supplied `Authorization` header cannot influence what doorman sends. |
+| `deny_unknown_credential` | Unrecognized credential name → 403. |
+| `deny_disallowed_host` | Credential used against a host outside its allowlist → 403. |
+| `deny_disallowed_method` | Credential used with a method outside its allowlist → 403. |
+| `deny_missing_cred_header` / `deny_multiple_cred_headers` | Zero or multiple `X-Doorman-Cred` headers → 403. |
+| `response_strips_set_cookie_and_www_authenticate` | Sensitive response headers are stripped before reaching the agent. |
+
+CI runs the full suite on Linux and macOS, with `clippy -D warnings`, on every push and PR. A separate audit workflow checks dependencies against the RustSec advisory DB on every Cargo manifest change and once a day on cron.
 
 ## Layout
 
