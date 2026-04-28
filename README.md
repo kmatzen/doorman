@@ -93,7 +93,6 @@ macOS's hardening primitives are weaker than systemd's; `_doorman` runs as a sep
 doormand run \
   --config ./doorman.yaml \
   --audit /tmp/doorman.audit \
-  --listen 127.0.0.1:18443 \
   --insecure-skip-mode-check
 ```
 
