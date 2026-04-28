@@ -54,11 +54,6 @@ const STRIPPED_RESPONSE_HEADERS: &[&str] = &["set-cookie", "www-authenticate"];
 /// Doorman strips this header from the request before forwarding upstream.
 const CRED_HEADER: &str = "x-doorman-cred";
 
-/// Always-on TLS port for the upstream. The agent's URI port (if any) is
-/// ignored; an MVP that talks to "real" APIs only ever needs 443. If you
-/// need a different port per credential, add it to the config later.
-const UPSTREAM_TLS_PORT: u16 = 443;
-
 #[derive(Clone)]
 pub struct Server {
     pub config: Arc<Config>,
@@ -74,6 +69,12 @@ pub async fn run(server: Server, listen: SocketAddr) -> Result<(), String> {
         .await
         .map_err(|e| format!("bind {}: {}", listen, e))?;
     eprintln!("doorman listening on {} (plain HTTP forward proxy)", listen);
+    serve_listener(server, listener).await
+}
+
+/// Serve on a pre-bound listener. Tests use this to bind on `127.0.0.1:0`
+/// and then learn the assigned port via `local_addr()`.
+pub async fn serve_listener(server: Server, listener: TcpListener) -> Result<(), String> {
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -231,7 +232,7 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
     };
     let upstream_req = Request::from_parts(parts, req_body);
 
-    let upstream_response = match send_upstream(&server, &target_host, upstream_req).await {
+    let upstream_response = match send_upstream(&server, &target_host, entry.port, upstream_req).await {
         Ok(r) => r,
         Err(e) => {
             return deny(
@@ -314,6 +315,7 @@ fn find_credential(headers: &hyper::HeaderMap) -> Result<String, &'static str> {
 async fn send_upstream<B>(
     server: &Server,
     target_host: &str,
+    target_port: u16,
     req: Request<B>,
 ) -> Result<Response<Incoming>, String>
 where
@@ -321,7 +323,7 @@ where
     B::Data: Send,
     B::Error: Into<DynErr>,
 {
-    let addr = format!("{}:{}", target_host, UPSTREAM_TLS_PORT);
+    let addr = format!("{}:{}", target_host, target_port);
     let tcp = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("dial {}: {}", addr, e))?;

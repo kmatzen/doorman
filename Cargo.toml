@@ -29,6 +29,11 @@ serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 libc = "0.2"
 
+[dev-dependencies]
+# Used only by tests/integration.rs to mint a CA + leaf cert for the mock
+# upstream. Not pulled into the release binary.
+rcgen = { version = "0.13", features = ["x509-parser"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

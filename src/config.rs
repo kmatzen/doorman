@@ -27,6 +27,8 @@ pub struct Entry {
     pub hosts: Vec<String>,
     /// Upper-cased method allowlist; empty means "any method".
     pub methods: Vec<String>,
+    /// Upstream TCP port. Defaults to 443.
+    pub port: u16,
 }
 
 impl Entry {
@@ -62,6 +64,8 @@ struct RawEntry {
     hosts: Vec<String>,
     #[serde(default)]
     methods: Option<Vec<String>>,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +163,11 @@ fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
     let (header_name, header_prefix, header_suffix) = parse_inject(&r.inject)
         .map_err(|e| format!("{} {:?}: inject {:?}: {}", where_(), r.name, r.inject, e))?;
 
+    let port = r.port.unwrap_or(443);
+    if port == 0 {
+        return Err(format!("{} {:?}: port must be > 0", where_(), r.name));
+    }
+
     Ok(Entry {
         name: r.name,
         secret: r.secret,
@@ -167,6 +176,7 @@ fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
         header_suffix,
         hosts,
         methods,
+        port,
     })
 }
 

@@ -131,6 +131,7 @@ Fields:
 - **`inject`**: a header template like `Header-Name: prefix {} suffix`. Exactly one `{}` slot.
 - **`hosts`**: upstream-host allowlist. Bare hostnames; match is case-insensitive, exact.
 - **`methods`**: optional HTTP method allowlist. Omitted = any method.
+- **`port`**: optional upstream TCP port. Defaults to 443.
 
 Two scopes for the same secret = two entries with different names.
 
@@ -156,6 +157,21 @@ One JSON line per request, fsync'd. Default path `/var/log/doorman/audit.log`, m
 
 No bodies, no headers, no secrets.
 
+**Rotation.** Doorman handles `SIGHUP` by re-opening the audit log file at the same path, so external rotators (logrotate, newsyslog) can move the current file aside and signal doorman to start writing a fresh one. Example logrotate stanza:
+
+```
+/var/log/doorman/audit.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    postrotate
+        /usr/bin/pkill -HUP -x doormand || true
+    endscript
+}
+```
+
 ## Security model
 
 Guarantees:
@@ -179,10 +195,10 @@ Not guaranteed:
 - **No peer-process identification in audit lines.** TCP sockets don't carry peer credentials. The intended deployment has one agent uid able to reach the proxy port.
 - **Audit gaps on the allow path.** Audit writes for allowed requests happen at end-of-stream. A failed audit write logs to stderr and serves; the deny path is still pre-response and fail-closed.
 - **Agent uses `http://` URLs even for HTTPS upstreams.** Doorman handles the TLS upgrade.
-- **Upstream port is always 443.** Any port in the agent's URI is ignored.
+- **Upstream port comes from the credential's `port` field**, not the agent's URI. Defaults to 443.
 - **HTTP/1.1 only**, both sides. No HTTP/2.
 - **No upstream connection pooling.** One TLS handshake per upstream request, ~50ms cost.
-- **No config hot-reload.** Restart to pick up changes; restarts are sub-second.
+- **No config hot-reload.** Restart to pick up changes; restarts are sub-second. (`SIGHUP` reopens the audit log only.)
 - **`install-service` doesn't install.** It prints; you redirect.
 
 ## Layout

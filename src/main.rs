@@ -17,9 +17,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-mod audit;
-mod config;
-mod proxy;
+use doorman::{audit, config, proxy};
 
 const DEFAULT_CONFIG: &str = "/etc/doorman/doorman.yaml";
 const DEFAULT_AUDIT: &str = "/var/log/doorman/audit.log";
@@ -141,12 +139,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 
     let cfg = config::load(&config_path, enforce_0400)?;
-    let audit = audit::Audit::open(&audit_path)?;
+    let audit = Arc::new(audit::Audit::open(&audit_path)?);
     let upstream_tls = proxy::upstream_tls();
 
     let server = proxy::Server {
         config: Arc::new(cfg),
-        audit: Arc::new(audit),
+        audit: Arc::clone(&audit),
         upstream_tls,
     };
 
@@ -164,10 +162,24 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         let sigint = async {
             tokio::signal::ctrl_c().await.ok();
         };
+        // SIGHUP triggers an audit-log re-open so external rotators can move
+        // the current log aside and have us pick up the new file.
+        let audit_for_sighup = Arc::clone(&audit);
+        let sighup = async move {
+            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("install SIGHUP handler");
+            while sig.recv().await.is_some() {
+                match audit_for_sighup.reopen() {
+                    Ok(()) => eprintln!("SIGHUP, audit log reopened"),
+                    Err(e) => eprintln!("SIGHUP, audit reopen failed: {}", e),
+                }
+            }
+        };
         tokio::select! {
             r = serve => { r }
             _ = sigterm => { eprintln!("SIGTERM, shutting down"); Ok(()) }
             _ = sigint => { eprintln!("SIGINT, shutting down"); Ok(()) }
+            _ = sighup => { Ok(()) }
         }
     })
 }
