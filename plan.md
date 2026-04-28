@@ -135,7 +135,7 @@ Five minutes, one config file, one env var. If it takes longer than that, the in
 
 Three things, and they're the ones to obsess over:
 
-**Correctness of the security boundary.** The `inject` substitution must be impossible to trick. The host allowlist must match the actual upstream after redirects (don't follow redirects across hosts; return the 3xx to the agent and let it decide). The audit log must flush on every line, not buffer. The config reload must not race with in-flight requests. These are unsexy and they are the entire product.
+**Correctness of the security boundary.** The `inject` substitution must be impossible to trick. The host allowlist must match the actual upstream after redirects (don't follow redirects across hosts; return the 3xx to the agent and let it decide). The audit log must flush on every line, not buffer. The config reload must not race with in-flight requests. These are unsexy and they are the entire job.
 
 **Operational quietness.** Doorman should be the boring service in the rack. No surprises on restart. No memory growth. No log spam. No required updates. If someone forgets it's running for six months, that's success.
 
@@ -166,4 +166,4 @@ These were in earlier drafts and were dropped:
 
 ## The pitch in one line
 
-Doorman is an HTTP proxy that holds your API keys and refuses to send them anywhere they don't belong. That's the whole product.
+Doorman is an HTTP proxy that holds your API keys and refuses to send them anywhere they don't belong. That's it.

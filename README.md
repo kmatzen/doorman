@@ -12,7 +12,7 @@ The blast radius drops from "everything the token can do" to "everything the pol
 
 ## What it isn't
 
-Not a secrets manager (it pulls from a YAML file you write; if you want Vault, put Vault behind that file). Not an authorization layer for the agent's *capabilities* — an allowed GitHub write can still open spam issues; that problem lives one layer up. Not OAuth-aware. Not a sandbox. The whole product fits in ~1100 lines because everything else got cut.
+Not a secrets manager (it pulls from a YAML file you write; if you want Vault, put Vault behind that file). Not an authorization layer for the agent's *capabilities* — an allowed GitHub write can still open spam issues; that problem lives one layer up. Not OAuth-aware. Not a sandbox. The whole thing fits in ~1100 lines because everything else got cut.
 
 See [plan.md](plan.md) for the full design rationale and the explicit list of non-goals.
 
