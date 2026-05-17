@@ -10,13 +10,14 @@ The agent process never sees the secret value. It names the credential it wants 
 ## How it works
 
 ```
-agent  ──HTTP_PROXY──▶  doormand  ──TLS──▶  upstream API
-   (plaintext)             │
+agent  ──HTTP_PROXY──▶  doormand  ──TLS────────▶  upstream API
+   (plaintext)             │     ──TLS+pin────▶  self-signed LAN device
+                           │     ──HTTP───────▶  plaintext LAN device
                            ├── reads doorman.yaml at startup
                            └── appends to audit.log per request
 ```
 
-The agent talks to doorman over plaintext HTTP on loopback. Doorman talks to the upstream over TLS.
+The agent talks to doorman over plaintext HTTP on loopback. Doorman talks to the upstream over TLS by default; per credential, the operator can either pin the upstream's self-signed cert (`tls_pinned_sha256`) or drop to plain HTTP (`tls: false`) for LAN devices that don't speak TLS at all.
 
 Per request, doorman:
 
@@ -179,8 +180,34 @@ Fields:
 - **`hosts`**: upstream-host allowlist. Bare hostnames; match is case-insensitive, exact.
 - **`methods`**: optional HTTP method allowlist. Omitted = any method.
 - **`port`**: optional upstream TCP port. Defaults to 443.
+- **`tls`**: optional boolean. Default `true` — doorman speaks TLS to the upstream, validating the chain against `webpki-roots`. Set to `false` for LAN devices that expose only plain HTTP (e.g. Home Assistant on `http://host:8123`). The agent-to-doorman hop is plaintext loopback either way; this only controls upstream transport.
+- **`tls_pinned_sha256`**: optional. 64 hex characters (32 raw bytes) of the SHA-256 of the upstream's leaf cert (DER). When present, doorman pins to exactly that cert and skips webpki chain validation. Use for self-signed LAN devices (UniFi gateway, Hue bridge, Hubitat). Only valid with `tls: true`; pairing it with `tls: false` is rejected at startup. Get the pin with `doormand fingerprint <host[:port]>`.
 
 Two scopes for the same secret = two entries with different names.
+
+### LAN-device examples
+
+```yaml
+# Home Assistant on plain HTTP, LAN only:
+- name: hass
+  secret: eyJhbGciOiJIUzI1NiIs...      # long-lived access token
+  inject: "Authorization: Bearer {}"
+  hosts: [192.168.86.188]
+  port: 8123
+  tls: false
+
+# UniFi gateway with its built-in self-signed cert. Pin once with
+# `doormand fingerprint 192.168.86.1` and paste the result here:
+- name: unifi
+  secret: 0123456789abcdef...           # X-API-Key from the UniFi UI
+  inject: "X-API-Key: {}"
+  hosts: [192.168.86.1]
+  tls_pinned_sha256: a7b81034cd439551c50a29b54355254a84942a0a990c1a9e12856c855b64b65f
+```
+
+### Updating a pin after a cert rotation
+
+Self-signed devices regenerate their cert on factory reset or some firmware updates. When that happens doorman will fail every request to that upstream with `tls connect: leaf cert SHA-256 does not match pin`. Re-run `doormand fingerprint <host>`, replace the value in the config, and `SIGHUP` is **not** enough — pinned configs are built once at startup, so restart the daemon.
 
 ## Audit log
 

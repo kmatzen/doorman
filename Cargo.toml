@@ -23,6 +23,10 @@ http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "0.26"
+# Already pulled in transitively by rustls; declared here because the pin
+# verifier and the `fingerprint` subcommand call `ring::digest::SHA256`
+# directly.
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
