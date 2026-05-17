@@ -131,6 +131,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

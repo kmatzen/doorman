@@ -1,7 +1,8 @@
 // The proxy core. Plain HTTP/1.1 forward proxy: agents speak plaintext to
-// doorman, doorman speaks TLS to the upstream. The agent's request URI may
-// be in absolute form (`GET http://api.github.com/path HTTP/1.1`) or in
-// origin form with a `Host:` header — both are accepted.
+// doorman, doorman speaks TLS (or plaintext, per-credential) to the upstream.
+// The agent's request URI may be in absolute form
+// (`GET http://api.github.com/path HTTP/1.1`) or in origin form with a
+// `Host:` header — both are accepted.
 //
 // Request flow:
 //   - extract upstream host (from URI authority or `Host` header)
@@ -9,8 +10,10 @@
 //   - look up the credential, validate host and method against the policy
 //   - drop the placeholder header and any hop-by-hop headers; inject the
 //     templated auth header per the credential's `inject` template
-//   - TLS-connect to the upstream on port 443; stream the request body
-//     through; stream the response body back; strip `Set-Cookie` and
+//   - dial the upstream on the credential's port; either TLS-handshake
+//     (with webpki roots, or with a SHA-256 leaf pin when the credential
+//     pins) or skip TLS entirely (when `tls: false`); stream the request
+//     body through; stream the response body back; strip `Set-Cookie` and
 //     `WWW-Authenticate` from the response
 //   - write one audit-log line at end-of-stream (or on drop)
 //
@@ -22,6 +25,7 @@
 //   - HTTP/2 (HTTP/1.1 only, on both sides)
 //   - cache or pool upstream connections (one TLS handshake per request)
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -39,12 +43,15 @@ use hyper::client::conn::http1 as client_http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::ServerName;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::ring::default_provider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
 use crate::audit::{self, Audit, Record};
-use crate::config::Config;
+use crate::config::{Config, Entry};
 
 /// Headers stripped from every upstream response before it goes back to the
 /// agent. Some upstreams put session material in these on auth errors.
@@ -58,7 +65,35 @@ const CRED_HEADER: &str = "x-doorman-cred";
 pub struct Server {
     pub config: Arc<Config>,
     pub audit: Arc<Audit>,
+    /// `ClientConfig` used for credentials that do plain webpki chain
+    /// validation (the historical default).
     pub upstream_tls: Arc<rustls::ClientConfig>,
+    /// Per-credential `ClientConfig`s, populated only for entries that pin
+    /// a leaf cert SHA-256. Each one carries a [`PinVerifier`] in place of
+    /// webpki chain validation. Keyed by credential name.
+    pub upstream_tls_pinned: Arc<HashMap<String, Arc<rustls::ClientConfig>>>,
+}
+
+impl Server {
+    /// Pick the right TLS client config for an entry. Returns `None` for
+    /// entries that don't do TLS at all (`tls: false`), which is a caller
+    /// signal to dial plain TCP.
+    fn tls_for(&self, entry: &Entry) -> Option<Arc<rustls::ClientConfig>> {
+        if !entry.tls {
+            return None;
+        }
+        if entry.tls_pin.is_some() {
+            // The map is built from the same config at startup, so a missing
+            // entry here is a programmer error — `expect` rather than fall
+            // back to webpki, which would be a silent downgrade.
+            let cfg = self
+                .upstream_tls_pinned
+                .get(&entry.name)
+                .expect("pinned entry has no precomputed ClientConfig");
+            return Some(Arc::clone(cfg));
+        }
+        Some(Arc::clone(&self.upstream_tls))
+    }
 }
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
@@ -232,7 +267,7 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
     };
     let upstream_req = Request::from_parts(parts, req_body);
 
-    let upstream_response = match send_upstream(&server, &target_host, entry.port, upstream_req).await {
+    let upstream_response = match send_upstream(&server, &target_host, entry, upstream_req).await {
         Ok(r) => r,
         Err(e) => {
             return deny(
@@ -315,7 +350,7 @@ fn find_credential(headers: &hyper::HeaderMap) -> Result<String, &'static str> {
 async fn send_upstream<B>(
     server: &Server,
     target_host: &str,
-    target_port: u16,
+    entry: &Entry,
     req: Request<B>,
 ) -> Result<Response<Incoming>, String>
 where
@@ -323,27 +358,49 @@ where
     B::Data: Send,
     B::Error: Into<DynErr>,
 {
-    let addr = format!("{}:{}", target_host, target_port);
+    let addr = format!("{}:{}", target_host, entry.port);
     let tcp = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("dial {}: {}", addr, e))?;
-    let server_name: ServerName<'static> = ServerName::try_from(target_host.to_string())
-        .map_err(|e| format!("server name {:?}: {}", target_host, e))?;
-    let connector = TlsConnector::from(Arc::clone(&server.upstream_tls));
-    let tls = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| format!("tls connect: {}", e))?;
-    let (mut sender, conn) = client_http1::handshake(TokioIo::new(tls))
-        .await
-        .map_err(|e| format!("h1 handshake: {}", e))?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    sender
-        .send_request(req)
-        .await
-        .map_err(|e| format!("send: {}", e))
+
+    // Two transport paths. `entry.tls = true` is the historical case —
+    // doorman wraps the TCP stream in TLS using either webpki roots or
+    // (when the credential pins a SHA-256) the precomputed pinned config.
+    // `entry.tls = false` is for LAN devices that expose plain HTTP;
+    // we hand the raw TCP stream to hyper directly.
+    match server.tls_for(entry) {
+        Some(tls_cfg) => {
+            let server_name: ServerName<'static> = ServerName::try_from(target_host.to_string())
+                .map_err(|e| format!("server name {:?}: {}", target_host, e))?;
+            let connector = TlsConnector::from(tls_cfg);
+            let tls = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| format!("tls connect: {}", e))?;
+            let (mut sender, conn) = client_http1::handshake(TokioIo::new(tls))
+                .await
+                .map_err(|e| format!("h1 handshake: {}", e))?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sender
+                .send_request(req)
+                .await
+                .map_err(|e| format!("send: {}", e))
+        }
+        None => {
+            let (mut sender, conn) = client_http1::handshake(TokioIo::new(tcp))
+                .await
+                .map_err(|e| format!("h1 handshake: {}", e))?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sender
+                .send_request(req)
+                .await
+                .map_err(|e| format!("send: {}", e))
+        }
+    }
 }
 
 /// Special-case deny for "we couldn't even figure out where this request was
@@ -422,17 +479,116 @@ fn full_body(b: Bytes) -> ProxyBody {
     Full::new(b).map_err(|e: Infallible| match e {}).boxed()
 }
 
-/// Build the `rustls::ClientConfig` doorman uses to talk to upstreams.
-/// Roots come from `webpki-roots` (Mozilla's set, statically linked) so
-/// there's no system-cert-store dependency.
+/// Build the `rustls::ClientConfig` doorman uses to talk to upstreams that
+/// don't pin a leaf cert. Roots come from `webpki-roots` (Mozilla's set,
+/// statically linked) so there's no system-cert-store dependency.
 pub fn upstream_tls() -> Arc<rustls::ClientConfig> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     Arc::new(cfg)
+}
+
+/// Build a per-credential `ClientConfig` for every entry that pins a leaf
+/// cert. Pinned configs use [`PinVerifier`] in place of webpki chain
+/// validation — the pin alone authenticates the upstream.
+pub fn upstream_tls_pinned(config: &Config) -> Arc<HashMap<String, Arc<rustls::ClientConfig>>> {
+    let _ = default_provider().install_default();
+    let mut out = HashMap::new();
+    for entry in &config.entries {
+        if let Some(pin) = entry.tls_pin {
+            let verifier = Arc::new(PinVerifier { pin });
+            let cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+            out.insert(entry.name.clone(), Arc::new(cfg));
+        }
+    }
+    Arc::new(out)
+}
+
+/// `ServerCertVerifier` that accepts exactly one specific leaf certificate,
+/// identified by the SHA-256 of its DER encoding. Skips webpki chain
+/// validation entirely — pin-or-fail is the whole point. Used for self-signed
+/// LAN devices where the cert isn't issued by any public CA.
+#[derive(Debug)]
+struct PinVerifier {
+    pin: [u8; 32],
+}
+
+impl ServerCertVerifier for PinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let actual = sha256(end_entity.as_ref());
+        if constant_time_eq(&actual, &self.pin) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "leaf cert SHA-256 does not match pin (got {})",
+                hex(&actual)
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        // Pinning binds the leaf identity; signature suites we accept are
+        // whatever the (vetted) provider offers.
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// SHA-256 of arbitrary bytes via ring (already in our dependency graph
+/// through rustls). Returned as 32 raw bytes for direct comparison with
+/// the pin.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let d = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(d.as_ref());
+    buf
+}
+
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 // --------------------------------------------------------------------------

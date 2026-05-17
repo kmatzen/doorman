@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
@@ -160,6 +161,14 @@ async fn spawn_doorman(
     entries: Vec<Entry>,
     upstream_tls: Arc<rustls::ClientConfig>,
 ) -> SocketAddr {
+    spawn_doorman_full(entries, upstream_tls, Arc::new(HashMap::new())).await
+}
+
+async fn spawn_doorman_full(
+    entries: Vec<Entry>,
+    upstream_tls: Arc<rustls::ClientConfig>,
+    upstream_tls_pinned: Arc<HashMap<String, Arc<rustls::ClientConfig>>>,
+) -> SocketAddr {
     static N: AtomicU64 = AtomicU64::new(0);
     let i = N.fetch_add(1, Ordering::Relaxed);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -172,6 +181,7 @@ async fn spawn_doorman(
         config: Arc::new(Config { entries }),
         audit: Arc::new(audit),
         upstream_tls,
+        upstream_tls_pinned,
     };
     tokio::spawn(async move {
         let _ = serve_listener(server, listener).await;
@@ -187,6 +197,20 @@ fn entry(
     methods: &[&str],
     port: u16,
 ) -> Entry {
+    entry_full(name, secret, header, hosts, methods, port, true, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn entry_full(
+    name: &str,
+    secret: &str,
+    header: &str,
+    hosts: &[&str],
+    methods: &[&str],
+    port: u16,
+    tls: bool,
+    tls_pin: Option<[u8; 32]>,
+) -> Entry {
     let inject = format!("{}: Bearer {{}}", header);
     let (header_name, prefix, suffix) = parse_inject(&inject);
     Entry {
@@ -198,6 +222,8 @@ fn entry(
         hosts: hosts.iter().map(|s| s.to_string()).collect(),
         methods: methods.iter().map(|s| s.to_uppercase()).collect(),
         port,
+        tls,
+        tls_pin,
     }
 }
 
@@ -493,5 +519,241 @@ async fn response_strips_set_cookie_and_www_authenticate() {
         headers.get("x-canary").map(|v| v.to_str().unwrap()),
         Some("untouched"),
         "non-sensitive headers must pass through"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Plaintext upstream (`tls: false`): the agent still talks loopback HTTP to
+// doorman, but doorman dials the upstream over plain TCP and skips the TLS
+// handshake. Models a LAN device like Home Assistant on http://host:8123.
+// --------------------------------------------------------------------------
+
+async fn spawn_plaintext_mock_upstream() -> (SocketAddr, Captured) {
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured_for_server = Arc::clone(&captured);
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                continue;
+            };
+            let captured = captured_for_server.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let captured = captured.clone();
+                    async move {
+                        let (parts, _body) = req.into_parts();
+                        let mut headers = HashMap::new();
+                        for (k, v) in parts.headers.iter() {
+                            headers.insert(
+                                k.as_str().to_lowercase(),
+                                v.to_str().unwrap_or("").to_string(),
+                            );
+                        }
+                        captured.lock().unwrap().push(CapturedRequest {
+                            method: parts.method.to_string(),
+                            path: parts.uri.path().to_string(),
+                            headers,
+                        });
+                        let response = Response::builder()
+                            .status(200)
+                            .body(Full::new(Bytes::from_static(b"plaintext-ok")))
+                            .unwrap();
+                        Ok::<_, hyper::Error>(response)
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tcp), svc)
+                    .await;
+            });
+        }
+    });
+    (addr, captured)
+}
+
+#[tokio::test]
+async fn plaintext_upstream_injects_secret_and_skips_tls() {
+    let (upstream_addr, captured) = spawn_plaintext_mock_upstream().await;
+    let proxy = spawn_doorman(
+        vec![entry_full(
+            "hass",
+            "ha_tok",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+            false,
+            None,
+        )],
+        // upstream_tls is unused on this code path, but Server still needs
+        // a placeholder. Use the default webpki one.
+        doorman::proxy::upstream_tls(),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/api/states",
+        vec![("X-Doorman-Cred", "hass")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"plaintext-ok");
+
+    let req = captured.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(req.method, "GET");
+    assert_eq!(req.path, "/api/states");
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some("Bearer ha_tok"),
+        "secret must still be injected on plaintext upstream"
+    );
+    assert!(
+        !req.headers.contains_key("x-doorman-cred"),
+        "cred header must not leak even on plaintext upstream"
+    );
+}
+
+// --------------------------------------------------------------------------
+// SHA-256 cert pinning: doorman skips webpki and accepts only the leaf
+// whose DER hashes to the configured pin. Models a self-signed LAN device
+// (UniFi, Hue bridge).
+// --------------------------------------------------------------------------
+
+/// Re-mint a fresh CA + leaf and return both the server config the upstream
+/// should use and the leaf DER bytes so the test can compute the pin.
+fn fresh_self_signed(hostname: &str) -> (Arc<rustls::ServerConfig>, Vec<u8>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let leaf_key = KeyPair::generate().expect("leaf keypair");
+    let mut params = CertificateParams::default();
+    params.subject_alt_names = vec![SanType::DnsName(
+        Ia5String::try_from(hostname.to_string()).unwrap(),
+    )];
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, hostname);
+    params.distinguished_name = dn;
+    let leaf = params.self_signed(&leaf_key).expect("self-sign leaf");
+    let leaf_der = leaf.der().to_vec();
+    let cert_der = rustls::pki_types::CertificateDer::from(leaf_der.clone());
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
+        .expect("encode key");
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server config");
+    (Arc::new(cfg), leaf_der)
+}
+
+fn sha256_hex(bytes: &[u8]) -> [u8; 32] {
+    let d = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
+#[tokio::test]
+async fn pinned_cert_allows_self_signed_upstream() {
+    let (server_cfg, leaf_der) = fresh_self_signed("localhost");
+    let (upstream_addr, captured) = spawn_mock_upstream(server_cfg).await;
+    let pin = sha256_hex(&leaf_der);
+
+    let entries = vec![entry_full(
+        "unifi",
+        "ui_tok",
+        "X-API-Key",
+        &["localhost"],
+        &[],
+        upstream_addr.port(),
+        true,
+        Some(pin),
+    )];
+    let mut pinned_map: HashMap<String, Arc<rustls::ClientConfig>> = HashMap::new();
+    // Build the pinned ClientConfig the same way the production code does.
+    let stub_cfg = Config {
+        entries: entries.clone(),
+    };
+    let built = doorman::proxy::upstream_tls_pinned(&stub_cfg);
+    for (k, v) in built.iter() {
+        pinned_map.insert(k.clone(), Arc::clone(v));
+    }
+    let proxy = spawn_doorman_full(
+        entries,
+        doorman::proxy::upstream_tls(),
+        Arc::new(pinned_map),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/proxy/network/api/s/default/stat/device",
+        vec![("X-Doorman-Cred", "unifi")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"upstream-ok");
+
+    let req = captured.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        req.headers.get("x-api-key").map(String::as_str),
+        Some("Bearer ui_tok"),
+    );
+}
+
+#[tokio::test]
+async fn pinned_cert_rejects_mismatched_leaf() {
+    // The upstream presents one self-signed cert; the credential pins a
+    // different (random) SHA-256. Connection must fail upstream-side; agent
+    // receives a 502.
+    let (server_cfg, _real_leaf) = fresh_self_signed("localhost");
+    let (upstream_addr, captured) = spawn_mock_upstream(server_cfg).await;
+    let wrong_pin = [0xde; 32];
+
+    let entries = vec![entry_full(
+        "unifi",
+        "ui_tok",
+        "X-API-Key",
+        &["localhost"],
+        &[],
+        upstream_addr.port(),
+        true,
+        Some(wrong_pin),
+    )];
+    let stub_cfg = Config {
+        entries: entries.clone(),
+    };
+    let built = doorman::proxy::upstream_tls_pinned(&stub_cfg);
+    let mut pinned_map: HashMap<String, Arc<rustls::ClientConfig>> = HashMap::new();
+    for (k, v) in built.iter() {
+        pinned_map.insert(k.clone(), Arc::clone(v));
+    }
+    let proxy = spawn_doorman_full(
+        entries,
+        doorman::proxy::upstream_tls(),
+        Arc::new(pinned_map),
+    )
+    .await;
+
+    // Use a short timeout so a hung handshake doesn't stall the test suite.
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        request(
+            proxy,
+            Method::GET,
+            "localhost",
+            "/x",
+            vec![("X-Doorman-Cred", "unifi")],
+        ),
+    )
+    .await
+    .expect("timed out");
+    assert_eq!(res.0, StatusCode::BAD_GATEWAY);
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "no upstream request should be served on pin mismatch"
     );
 }

@@ -30,6 +30,7 @@ fn main() -> ExitCode {
     let result = match cmd {
         "install-service" => cmd_install_service(rest),
         "run" => cmd_run(rest),
+        "fingerprint" => cmd_fingerprint(rest),
         "" | "-h" | "--help" => {
             print_usage();
             return ExitCode::SUCCESS;
@@ -54,7 +55,8 @@ fn print_usage() {
         "doormand — an HTTP proxy that holds your API keys.\n\n\
          usage:\n  \
            doormand install-service [--bin-path PATH]\n  \
-           doormand run [--config PATH] [--audit PATH] [--listen ADDR]\n"
+           doormand run [--config PATH] [--audit PATH] [--listen ADDR]\n  \
+           doormand fingerprint <host[:port]>\n"
     );
 }
 
@@ -106,6 +108,110 @@ fn print_launchd_plist(bin: &str) {
     print!("{}", LAUNCHD_TEMPLATE.replace("__BIN_PATH__", bin));
 }
 
+/// `doormand fingerprint <host[:port]>` — open a TLS connection to the
+/// upstream accepting any certificate, print `sha256:<hex>` for the leaf,
+/// and exit. Output is meant to be pasted straight into a credential
+/// entry's `tls_pinned_sha256` field. No audit log, no config — this is
+/// an out-of-band helper for the bootstrap step where the operator decides
+/// what to pin.
+fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
+    let target = args.first().ok_or("fingerprint: missing <host[:port]>")?;
+    if args.len() > 1 {
+        return Err(format!("fingerprint: unexpected extra arg {:?}", args[1]));
+    }
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|e| format!("invalid port {:?}: {}", p, e))?,
+        ),
+        None => (target.clone(), 443),
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("build runtime: {}", e))?;
+    runtime.block_on(async move {
+        use std::sync::Arc;
+        use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{DigitallySignedStruct, SignatureScheme};
+        use tokio::net::TcpStream;
+        use tokio_rustls::TlsConnector;
+
+        #[derive(Debug)]
+        struct CaptureFirstCert {
+            leaf: std::sync::Mutex<Option<Vec<u8>>>,
+        }
+        impl ServerCertVerifier for CaptureFirstCert {
+            fn verify_server_cert(
+                &self,
+                end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                *self.leaf.lock().unwrap() = Some(end_entity.as_ref().to_vec());
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _m: &[u8],
+                _c: &CertificateDer<'_>,
+                _d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _m: &[u8],
+                _c: &CertificateDer<'_>,
+                _d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = Arc::new(CaptureFirstCert {
+            leaf: std::sync::Mutex::new(None),
+        });
+        let cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::clone(&verifier) as _)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(cfg));
+        let addr = format!("{}:{}", host, port);
+        let tcp = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| format!("dial {}: {}", addr, e))?;
+        let server_name: ServerName<'static> = ServerName::try_from(host.clone())
+            .map_err(|e| format!("server name {:?}: {}", host, e))?;
+        // We don't need to send anything — just complete the handshake so the
+        // verifier sees the cert. `connect` returns once the handshake is
+        // done; we drop the stream immediately.
+        let _tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| format!("tls connect: {}", e))?;
+        let leaf = verifier
+            .leaf
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("handshake completed but verifier captured no leaf")?;
+        let digest = doorman::proxy::sha256(&leaf);
+        println!("sha256:{}", doorman::proxy::hex(&digest));
+        Ok::<(), String>(())
+    })
+}
+
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG);
     let mut audit_path = PathBuf::from(DEFAULT_AUDIT);
@@ -139,13 +245,15 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 
     let cfg = config::load(&config_path, enforce_0400)?;
-    let audit = Arc::new(audit::Audit::open(&audit_path)?);
     let upstream_tls = proxy::upstream_tls();
+    let upstream_tls_pinned = proxy::upstream_tls_pinned(&cfg);
+    let audit = Arc::new(audit::Audit::open(&audit_path)?);
 
     let server = proxy::Server {
         config: Arc::new(cfg),
         audit: Arc::clone(&audit),
         upstream_tls,
+        upstream_tls_pinned,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
