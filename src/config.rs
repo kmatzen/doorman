@@ -29,6 +29,17 @@ pub struct Entry {
     pub methods: Vec<String>,
     /// Upstream TCP port. Defaults to 443.
     pub port: u16,
+    /// Whether doorman speaks TLS to the upstream. Default true. Set to
+    /// false for LAN devices that only expose plain HTTP (e.g. a local
+    /// Home Assistant on port 8123). The agent-to-doorman hop remains
+    /// plaintext loopback either way; this only controls upstream transport.
+    pub tls: bool,
+    /// Optional SHA-256 (32 raw bytes) of the upstream leaf certificate (DER).
+    /// When present, doorman pins to exactly this cert and skips webpki
+    /// chain validation. Use for self-signed devices (UniFi, Hue bridge,
+    /// etc.). Only meaningful when `tls = true`; configs that mix `tls:
+    /// false` with a pin are rejected at load time.
+    pub tls_pin: Option<[u8; 32]>,
 }
 
 impl Entry {
@@ -66,6 +77,10 @@ struct RawEntry {
     methods: Option<Vec<String>>,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    tls: Option<bool>,
+    #[serde(default)]
+    tls_pinned_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +183,21 @@ fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
         return Err(format!("{} {:?}: port must be > 0", where_(), r.name));
     }
 
+    let tls = r.tls.unwrap_or(true);
+    let tls_pin = match r.tls_pinned_sha256.as_deref() {
+        None | Some("") => None,
+        Some(hex) => Some(parse_pin_hex(hex).map_err(|e| {
+            format!("{} {:?}: tls_pinned_sha256 {:?}: {}", where_(), r.name, hex, e)
+        })?),
+    };
+    if !tls && tls_pin.is_some() {
+        return Err(format!(
+            "{} {:?}: tls_pinned_sha256 set but tls is false (a pin without TLS is meaningless)",
+            where_(),
+            r.name
+        ));
+    }
+
     Ok(Entry {
         name: r.name,
         secret: r.secret,
@@ -177,7 +207,34 @@ fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
         hosts,
         methods,
         port,
+        tls,
+        tls_pin,
     })
+}
+
+/// Parse a SHA-256 pin as 64 lowercase-hex characters into 32 raw bytes.
+/// Accepts upper or lower case but rejects whitespace, prefixes (`sha256:`),
+/// and any non-hex character — keeping the surface tight makes audits easy.
+fn parse_pin_hex(s: &str) -> Result<[u8; 32], &'static str> {
+    if s.len() != 64 {
+        return Err("must be 64 hex characters (32 bytes of SHA-256)");
+    }
+    let mut out = [0u8; 32];
+    for (i, byte_chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(byte_chunk[0])?;
+        let lo = hex_nibble(byte_chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, &'static str> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("contains non-hex characters"),
+    }
 }
 
 /// Parse a string like `Authorization: Bearer {}` into
@@ -292,6 +349,93 @@ mod tests {
         assert!(e.method_allowed("GET"));
         assert!(e.method_allowed("post"));
         assert!(!e.method_allowed("DELETE"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn defaults_tls_true_and_no_pin() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n");
+        let cfg = load(&p, false).unwrap();
+        assert!(cfg.entries[0].tls);
+        assert!(cfg.entries[0].tls_pin.is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn accepts_tls_false_for_plaintext_upstream() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  tls: false\n  port: 8123\n");
+        let cfg = load(&p, false).unwrap();
+        assert!(!cfg.entries[0].tls);
+        assert_eq!(cfg.entries[0].port, 8123);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn accepts_valid_pin_hex64() {
+        let hex = "a".repeat(64);
+        let yaml = format!(
+            "- name: a\n  secret: x\n  inject: 'X: {{}}'\n  hosts: [a.com]\n  tls_pinned_sha256: '{}'\n",
+            hex
+        );
+        let p = write_tmp(&yaml);
+        let cfg = load(&p, false).unwrap();
+        assert_eq!(cfg.entries[0].tls_pin.unwrap(), [0xaa; 32]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pin_accepts_mixed_case_hex() {
+        let hex = "Ab".repeat(32);
+        let yaml = format!(
+            "- name: a\n  secret: x\n  inject: 'X: {{}}'\n  hosts: [a.com]\n  tls_pinned_sha256: '{}'\n",
+            hex
+        );
+        let p = write_tmp(&yaml);
+        let cfg = load(&p, false).unwrap();
+        assert_eq!(cfg.entries[0].tls_pin.unwrap(), [0xab; 32]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_pin_wrong_length() {
+        let yaml = "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  tls_pinned_sha256: 'abcd'\n";
+        let p = write_tmp(yaml);
+        let err = load(&p, false).unwrap_err();
+        assert!(err.contains("64 hex characters"), "got: {}", err);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_pin_non_hex() {
+        let bad = "z".repeat(64);
+        let yaml = format!(
+            "- name: a\n  secret: x\n  inject: 'X: {{}}'\n  hosts: [a.com]\n  tls_pinned_sha256: '{}'\n",
+            bad
+        );
+        let p = write_tmp(&yaml);
+        let err = load(&p, false).unwrap_err();
+        assert!(err.contains("non-hex"), "got: {}", err);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_pin_with_tls_false() {
+        let hex = "a".repeat(64);
+        let yaml = format!(
+            "- name: a\n  secret: x\n  inject: 'X: {{}}'\n  hosts: [a.com]\n  tls: false\n  tls_pinned_sha256: '{}'\n",
+            hex
+        );
+        let p = write_tmp(&yaml);
+        let err = load(&p, false).unwrap_err();
+        assert!(err.contains("meaningless"), "got: {}", err);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn empty_pin_string_is_treated_as_none() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  tls_pinned_sha256: ''\n");
+        let cfg = load(&p, false).unwrap();
+        assert!(cfg.entries[0].tls_pin.is_none());
         std::fs::remove_file(&p).ok();
     }
 }

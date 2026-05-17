@@ -19,3 +19,22 @@
   secret: xoxb-replace-me
   inject: "Authorization: Bearer {}"
   hosts: [slack.com]
+
+# --- LAN devices ----------------------------------------------------------
+# `tls: false` makes doorman speak plain HTTP to the upstream. Use only for
+# loopback / RFC 1918 destinations the operator trusts at the network layer.
+- name: hass_local
+  secret: long_lived_access_token_replace_me
+  inject: "Authorization: Bearer {}"
+  hosts: [192.168.86.188]
+  port: 8123
+  tls: false
+
+# `tls_pinned_sha256` makes doorman accept exactly one self-signed leaf cert
+# and skip webpki chain validation. Obtain the pin with:
+#   doormand fingerprint 192.168.86.1
+- name: unifi_local
+  secret: ui_api_key_replace_me
+  inject: "X-API-Key: {}"
+  hosts: [192.168.86.1]
+  tls_pinned_sha256: REPLACE_WITH_64_HEX_CHARS_FROM_FINGERPRINT
