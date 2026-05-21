@@ -1,4 +1,4 @@
-// Entry point. Two subcommands:
+// Entry point. Subcommands:
 //
 //   doormand install-service
 //       Print a service definition tailored to this binary's path —
@@ -8,6 +8,15 @@
 //   doormand run [--config PATH] [--audit PATH] [--listen ADDR]
 //       The actual proxy. Refuses to start if any of: config missing/looser
 //       than 0400, audit log unwritable.
+//
+//   doormand validate-config [--config PATH] [--insecure-skip-mode-check]
+//       Run the same config validation `run` does, then exit — without
+//       binding the port, opening the audit log, or touching an upstream.
+//       Lets setup flows catch a typo before restarting a live daemon.
+//
+//   doormand fingerprint <host[:port]>
+//       Print `sha256:<hex>` of an upstream's leaf cert, for pasting into a
+//       credential's `tls_pinned_sha256` field.
 //
 // Argument parsing is done by hand because the surface is tiny and the spec
 // takes a hard line on dependency creep.
@@ -30,6 +39,7 @@ fn main() -> ExitCode {
     let result = match cmd {
         "install-service" => cmd_install_service(rest),
         "run" => cmd_run(rest),
+        "validate-config" => cmd_validate_config(rest),
         "fingerprint" => cmd_fingerprint(rest),
         "" | "-h" | "--help" => {
             print_usage();
@@ -56,6 +66,7 @@ fn print_usage() {
          usage:\n  \
            doormand install-service [--bin-path PATH]\n  \
            doormand run [--config PATH] [--audit PATH] [--listen ADDR]\n  \
+           doormand validate-config [--config PATH] [--insecure-skip-mode-check]\n  \
            doormand fingerprint <host[:port]>\n"
     );
 }
@@ -210,6 +221,47 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
         println!("sha256:{}", doorman::proxy::hex(&digest));
         Ok::<(), String>(())
     })
+}
+
+/// `doormand validate-config [--config PATH] [--insecure-skip-mode-check]` —
+/// load and validate the config, then exit. Runs exactly the checks `run`
+/// does (YAML syntax, the `inject` template shape, host/method allowlists,
+/// the `tls`/`tls_pinned_sha256` consistency rules, the mode-0400 gate) but
+/// never binds the listen port, opens the audit log, or contacts an upstream.
+/// Lets setup and bootstrap flows catch a typo'd config *before* tearing down
+/// a running daemon. On success prints the loaded credential names — names
+/// only, never secrets — and exits 0; any error exits non-zero.
+fn cmd_validate_config(args: &[String]) -> Result<(), String> {
+    let mut config_path = PathBuf::from(DEFAULT_CONFIG);
+    let mut enforce_0400 = true;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                config_path = PathBuf::from(args.get(i + 1).ok_or("missing value for --config")?);
+                i += 2;
+            }
+            "--insecure-skip-mode-check" => {
+                enforce_0400 = false;
+                i += 1;
+            }
+            other => return Err(format!("validate-config: unknown flag {:?}", other)),
+        }
+    }
+
+    let cfg = config::load(&config_path, enforce_0400)?;
+    let n = cfg.entries.len();
+    println!(
+        "config OK: {} ({} credential{})",
+        config_path.display(),
+        n,
+        if n == 1 { "" } else { "s" }
+    );
+    for entry in &cfg.entries {
+        println!("  {}", entry.name);
+    }
+    Ok(())
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
