@@ -130,6 +130,16 @@ doormand run \
 
 `--insecure-skip-mode-check` lets you use a config file that isn't mode 0400. Don't use it in production.
 
+### Validate a config before restarting
+
+`validate-config` runs the full config validation — YAML syntax, the `inject` template shape, host/method allowlists, the `tls`/`tls_pinned_sha256` consistency rules, and the mode-0400 gate — without binding the proxy port, opening the audit log, or contacting any upstream. Run it before restarting a live daemon so a typo fails here instead of taking the proxy down:
+
+```
+doormand validate-config --config /etc/doorman/doorman.yaml
+```
+
+On success it prints the loaded credential names (names only — never secrets) and exits 0; on any error it prints the problem and exits non-zero. Pass `--insecure-skip-mode-check` to validate a dev config that isn't mode 0400.
+
 ## Use
 
 ```
@@ -288,7 +298,7 @@ macOS's hardening primitives are weaker than systemd's. The `_doorman` user prov
 - **Upstream port comes from the credential's `port` field**, not the agent's URI. Defaults to 443.
 - **HTTP/1.1 only**, both sides. No HTTP/2.
 - **No upstream connection pooling.** One TLS handshake per upstream request, ~50ms cost.
-- **No config hot-reload.** Restart to pick up changes; restarts are sub-second. (`SIGHUP` reopens the audit log only.)
+- **No config hot-reload.** Restart to pick up changes; restarts are sub-second. (`SIGHUP` reopens the audit log only.) Validate first with `doormand validate-config` so a typo fails before the restart, not after.
 - **`install-service` doesn't install.** It prints; you redirect.
 
 ## Testing
@@ -310,7 +320,7 @@ CI runs the full suite on Linux and macOS, with `clippy -D warnings`, on every p
 ## Layout
 
 ```
-src/main.rs       CLI dispatch (install-service / run)
+src/main.rs       CLI dispatch (install-service / run / validate-config / fingerprint)
 src/config.rs     YAML loader
 src/audit.rs      JSON-line audit writer, fsync per record
 src/proxy.rs      HTTP/1.1 server, header rewrite, upstream TLS, body streaming
