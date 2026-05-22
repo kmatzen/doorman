@@ -38,6 +38,18 @@ pub struct Record<'a> {
     pub protocol: Option<&'static str>,
 }
 
+/// One config-load audit line — a distinct shape from [`Record`]. It captures
+/// a SHA-256 of the config file and the credential names it defines (never the
+/// secrets), so that a config change is visible in the audit trail even though
+/// edits happen out-of-band (the file is mode 0400, owned by the daemon uid).
+#[derive(Debug, Serialize)]
+pub struct ConfigLoad<'a> {
+    pub ts: String,
+    pub event: &'static str,
+    pub config_sha256: &'a str,
+    pub credentials: &'a [String],
+}
+
 pub struct Audit {
     path: PathBuf,
     file: Mutex<File>,
@@ -61,7 +73,17 @@ impl Audit {
     /// Serialize, append, flush, fsync. Returns an error if any of those
     /// fail; the caller must treat that as fail-closed.
     pub fn write(&self, rec: &Record<'_>) -> Result<(), String> {
-        let mut buf = serde_json::to_vec(rec).map_err(|e| format!("serialize audit: {}", e))?;
+        self.write_line(rec)
+    }
+
+    /// Append a config-load line (fingerprint + credential names, no secrets).
+    /// Same durability as a request record.
+    pub fn write_config_load(&self, rec: &ConfigLoad<'_>) -> Result<(), String> {
+        self.write_line(rec)
+    }
+
+    fn write_line<T: Serialize>(&self, value: &T) -> Result<(), String> {
+        let mut buf = serde_json::to_vec(value).map_err(|e| format!("serialize audit: {}", e))?;
         buf.push(b'\n');
         let mut f = self.file.lock().unwrap();
         f.write_all(&buf).map_err(|e| format!("write audit: {}", e))?;
@@ -158,5 +180,26 @@ mod tests {
 
         std::fs::remove_file(&p).ok();
         std::fs::remove_file(&p_rotated).ok();
+    }
+
+    #[test]
+    fn config_load_line_carries_fingerprint_and_names_only() {
+        let p = tmp_path();
+        let _ = std::fs::remove_file(&p);
+        let audit = Audit::open(&p).unwrap();
+        let names = vec!["github".to_string(), "stripe".to_string()];
+        audit
+            .write_config_load(&ConfigLoad {
+                ts: now_rfc3339(),
+                event: "config_load",
+                config_sha256: "abc123",
+                credentials: &names,
+            })
+            .unwrap();
+        let line = std::fs::read_to_string(&p).unwrap();
+        assert!(line.contains("\"event\":\"config_load\""), "got: {}", line);
+        assert!(line.contains("\"config_sha256\":\"abc123\""), "got: {}", line);
+        assert!(line.contains("github") && line.contains("stripe"), "got: {}", line);
+        std::fs::remove_file(&p).ok();
     }
 }
