@@ -22,6 +22,7 @@ use rcgen::{
     SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -755,5 +756,210 @@ async fn pinned_cert_rejects_mismatched_leaf() {
     assert!(
         captured.lock().unwrap().is_empty(),
         "no upstream request should be served on pin mismatch"
+    );
+}
+
+// --------------------------------------------------------------------------
+// WebSocket / HTTP Upgrade relay. doorman injects the credential on the
+// handshake, forwards it, and once the upstream returns 101 it splices the two
+// connections byte-for-byte. The mock upstream below speaks the handshake by
+// hand and then echoes raw bytes — matching doorman's byte-splice model (it
+// does not parse WS frames).
+// --------------------------------------------------------------------------
+
+/// A TLS upstream that completes an HTTP/1.1 Upgrade handshake (captures the
+/// request head, replies 101) and then echoes every subsequent byte.
+async fn spawn_ws_mock_upstream(server_tls: Arc<rustls::ServerConfig>) -> (SocketAddr, Captured) {
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured_for_server = Arc::clone(&captured);
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                continue;
+            };
+            let acceptor = TlsAcceptor::from(server_tls.clone());
+            let captured = captured_for_server.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                // Read the request head (up to CRLFCRLF). The client waits for
+                // the 101 before sending payload, so nothing trails the head.
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    match tls.read(&mut tmp).await {
+                        Ok(0) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => return,
+                    }
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let mut lines = text.split("\r\n");
+                let mut request_line = lines.next().unwrap_or("").split_whitespace();
+                let method = request_line.next().unwrap_or("").to_string();
+                let path = request_line.next().unwrap_or("").to_string();
+                let mut headers = HashMap::new();
+                for line in lines {
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(CapturedRequest { method, path, headers });
+
+                let resp = "HTTP/1.1 101 Switching Protocols\r\n\
+                            Upgrade: websocket\r\n\
+                            Connection: Upgrade\r\n\
+                            Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+                            set-cookie: should-be-stripped=1\r\n\r\n";
+                if tls.write_all(resp.as_bytes()).await.is_err() {
+                    return;
+                }
+                // Echo until the client closes.
+                loop {
+                    match tls.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tls.write_all(&tmp[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    });
+    (addr, captured)
+}
+
+/// Read from a raw socket until the HTTP head terminator, returning it as text.
+async fn read_head(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 256];
+    loop {
+        let n = stream.read(&mut tmp).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+const WS_REQUEST_TMPL: &str = "GET {PATH} HTTP/1.1\r\n\
+     Host: {HOST}\r\n\
+     X-Doorman-Cred: {CRED}\r\n\
+     Connection: Upgrade\r\n\
+     Upgrade: websocket\r\n\
+     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+     Sec-WebSocket-Version: 13\r\n\r\n";
+
+fn ws_request(path: &str, host: &str, cred: &str) -> String {
+    WS_REQUEST_TMPL
+        .replace("{PATH}", path)
+        .replace("{HOST}", host)
+        .replace("{CRED}", cred)
+}
+
+#[tokio::test]
+async fn websocket_upgrade_relays_splices_and_injects_credential() {
+    let ca = TestCa::generate();
+    let (upstream_addr, captured) = spawn_ws_mock_upstream(ca.server_config_for("localhost")).await;
+    let proxy = spawn_doorman(
+        vec![entry(
+            "wscred",
+            "WS_SECRET",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    stream
+        .write_all(ws_request("/chat", "localhost", "wscred").as_bytes())
+        .await
+        .unwrap();
+
+    // doorman returns 101, stripped of sensitive response headers.
+    let head = read_head(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {:?}", head);
+    assert!(
+        !head.to_lowercase().contains("set-cookie"),
+        "set-cookie must be stripped from the 101: {:?}",
+        head
+    );
+
+    // The byte-splice works in both directions.
+    stream.write_all(b"hello-ws").await.unwrap();
+    let mut echo = [0u8; 8];
+    stream.read_exact(&mut echo).await.unwrap();
+    assert_eq!(&echo, b"hello-ws");
+
+    // The upstream saw the injected credential and not the cred header, and the
+    // upgrade headers reached it intact.
+    let req = captured.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(req.method, "GET");
+    assert_eq!(req.path, "/chat");
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some("Bearer WS_SECRET")
+    );
+    assert!(
+        !req.headers.contains_key("x-doorman-cred"),
+        "cred header must not leak upstream"
+    );
+    assert_eq!(
+        req.headers.get("upgrade").map(String::as_str),
+        Some("websocket")
+    );
+}
+
+#[tokio::test]
+async fn websocket_upgrade_to_disallowed_host_is_denied() {
+    let ca = TestCa::generate();
+    let (upstream_addr, captured) = spawn_ws_mock_upstream(ca.server_config_for("localhost")).await;
+    let proxy = spawn_doorman(
+        vec![entry(
+            "wscred",
+            "WS_SECRET",
+            "Authorization",
+            &["allowed.example"], // localhost is NOT allowlisted
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    stream
+        .write_all(ws_request("/chat", "localhost", "wscred").as_bytes())
+        .await
+        .unwrap();
+
+    let head = read_head(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "expected 403, got: {:?}", head);
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "upstream must not be contacted when the host is denied"
     );
 }

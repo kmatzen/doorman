@@ -166,6 +166,21 @@ curl --proxy http://127.0.0.1:18443 \
 - Credential names must match config entries exactly (case-sensitive).
 - Doorman overwrites the `Authorization` header (or whatever the `inject` template targets); the agent can't influence it.
 
+### WebSocket upgrades
+
+WebSocket connections work through the proxy. Use a `ws://` URL (not `wss://`) and set `X-Doorman-Cred` the same way — doorman injects the credential on the HTTP/1.1 Upgrade handshake, enforces the host/method allowlist on it, and once the upstream returns `101 Switching Protocols` splices the two connections byte-for-byte until either side closes:
+
+```
+curl --proxy http://127.0.0.1:18443 \
+     -H 'X-Doorman-Cred: hass' \
+     --include -N \
+     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+     -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13' \
+     http://homeassistant.local/api/websocket
+```
+
+doorman doesn't parse WebSocket frames — after the handshake it's an opaque relay. A relayed socket produces one audit line at close, with `"protocol":"websocket"` and the byte counts each direction. A handshake to a non-allowlisted host is denied with 403, exactly like a normal request.
+
 ## Config
 
 `/etc/doorman/doorman.yaml`, mode 0400, owned by the doorman uid. A YAML list of entries:
@@ -246,6 +261,7 @@ One JSON line per request, fsync'd. Default path `/var/log/doorman/audit.log`, m
 | `ms` | total latency, accept to last byte |
 | `decision` | `"allow"` or `"deny"` |
 | `reason` | denial reason (denies only) |
+| `protocol` | `"websocket"` for a spliced Upgrade relay; omitted for normal request/response |
 
 No bodies, no headers, no secrets.
 

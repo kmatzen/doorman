@@ -17,10 +17,18 @@
 //     `WWW-Authenticate` from the response
 //   - write one audit-log line at end-of-stream (or on drop)
 //
+// WebSocket / HTTP-Upgrade requests (a `Connection: upgrade` + `Upgrade:`
+// header pair) take a variant of the same path: the credential is injected on
+// the handshake exactly as above, the host/method allowlist is enforced just
+// like any other request, and if the upstream answers 101 the two connections
+// are spliced byte-for-byte until either side closes. doorman does not parse
+// WebSocket frames — once upgraded it's an opaque relay.
+//
 // What this module deliberately does NOT do:
 //   - terminate TLS on the agent side (no CA, no per-host leaf certs)
 //   - support HTTPS_PROXY / `CONNECT` (the agent must use HTTP_PROXY and
-//     `http://` URLs)
+//     `http://` URLs; WebSockets go through the `Upgrade` path above, not
+//     `CONNECT`)
 //   - follow redirects (3xx returned to the agent verbatim)
 //   - HTTP/2 (HTTP/1.1 only, on both sides)
 //   - cache or pool upstream connections (one TLS handshake per request)
@@ -35,9 +43,9 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{HeaderName, HeaderValue, HOST};
+use hyper::header::{HeaderName, HeaderValue, CONNECTION, HOST, UPGRADE};
 use hyper::server::conn::http1 as server_http1;
 use hyper::client::conn::http1 as client_http1;
 use hyper::service::service_fn;
@@ -47,6 +55,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
@@ -134,13 +143,17 @@ async fn handle_connection(server: Server, stream: TcpStream) -> Result<(), Stri
     });
     server_http1::Builder::new()
         .serve_connection(TokioIo::new(stream), svc)
+        // `.with_upgrades()` lets a 101 response we return hand the raw
+        // connection back to us for a WebSocket byte-splice. No effect on
+        // ordinary request/response traffic.
+        .with_upgrades()
         .await
         .map_err(|e| format!("h1: {}", e))
 }
 
 /// One inbound HTTP request from the agent. Returns either a doorman 4xx/5xx
 /// or the streamed upstream response.
-async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
+async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody> {
     let started = Instant::now();
     let method = req.method().clone();
 
@@ -158,6 +171,16 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
+
+    // Detect an HTTP/1.1 Upgrade (WebSocket) request and, if it is one, take
+    // the agent-side upgrade handle now — before the request is torn apart.
+    // Holding it is harmless even if we go on to deny: the upgrade only
+    // happens if this handler returns a 101.
+    let agent_upgrade = if is_upgrade_request(req.headers()) {
+        Some(hyper::upgrade::on(&mut req))
+    } else {
+        None
+    };
 
     let (mut parts, body) = req.into_parts();
 
@@ -218,10 +241,12 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
         );
     }
 
-    // Rewrite headers: drop the cred-name header (it's a doorman-internal
-    // signal and must not leak upstream), drop hop-by-hop and length-shaped
-    // headers (hyper computes them from the body), inject the templated auth
-    // header, and set Host to the canonical target.
+    // Rewrite headers (shared by the normal and the WebSocket-upgrade paths):
+    // drop the cred-name header (a doorman-internal signal that must not leak
+    // upstream), drop the proxy-hop and length-shaped headers, inject the
+    // templated auth header, and set Host to the canonical target. We leave
+    // `Connection`, `Upgrade` and any `Sec-WebSocket-*` headers untouched so an
+    // upgrade handshake reaches the upstream intact.
     parts.headers.remove(CRED_HEADER);
     for h in [
         "proxy-connection",
@@ -259,6 +284,24 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
         }
     };
 
+    // WebSocket/Upgrade path: forward the handshake with an empty body and, on
+    // a 101 from the upstream, splice the two connections byte-for-byte.
+    if let Some(agent_upgrade) = agent_upgrade {
+        let upstream_req = Request::from_parts(parts, Empty::<Bytes>::new());
+        return relay_upgrade(
+            &server,
+            entry,
+            target_host,
+            cred_name,
+            method.as_str().to_string(),
+            path_and_query,
+            upstream_req,
+            agent_upgrade,
+            started,
+        )
+        .await;
+    }
+
     let bytes_in_counter = Arc::new(AtomicU64::new(0));
     let req_body = Counting {
         inner: body,
@@ -283,6 +326,154 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
         }
     };
 
+    finish_response(
+        &server,
+        upstream_response,
+        cred_name,
+        target_host,
+        method.as_str().to_string(),
+        path_and_query,
+        bytes_in_counter,
+        started,
+    )
+}
+
+/// True for an HTTP/1.1 Upgrade request: a `Connection` header that lists the
+/// `upgrade` token together with an `Upgrade` header (e.g. `Upgrade: websocket`).
+fn is_upgrade_request(headers: &hyper::HeaderMap) -> bool {
+    let connection_lists_upgrade = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"));
+    connection_lists_upgrade && headers.contains_key(UPGRADE)
+}
+
+/// Relay a WebSocket/Upgrade handshake to the upstream. The credential has
+/// already been validated against the host/method allowlist by `serve`. We
+/// forward the (already-rewritten) request, and if the upstream answers 101 we
+/// return our own 101 to the agent and splice the two upgraded connections
+/// byte-for-byte until either side closes. Anything other than 101 from the
+/// upstream is relayed back like a normal response.
+#[allow(clippy::too_many_arguments)]
+async fn relay_upgrade(
+    server: &Server,
+    entry: &Entry,
+    target_host: String,
+    cred_name: String,
+    method: String,
+    path: String,
+    upstream_req: Request<Empty<Bytes>>,
+    agent_upgrade: hyper::upgrade::OnUpgrade,
+    started: Instant,
+) -> Response<ProxyBody> {
+    let mut upstream_response = match send_upstream(server, &target_host, entry, upstream_req).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return deny(
+                server,
+                &target_host,
+                &method,
+                &path,
+                Some(&cred_name),
+                StatusCode::BAD_GATEWAY,
+                Some(format!("upstream: {}", e).leak()),
+                started,
+            );
+        }
+    };
+
+    if upstream_response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        // Upstream declined the upgrade (404, 426, 401, …). Relay it back as a
+        // normal response; the agent's upgrade simply never fires.
+        return finish_response(
+            server,
+            upstream_response,
+            cred_name,
+            target_host,
+            method,
+            path,
+            Arc::new(AtomicU64::new(0)),
+            started,
+        );
+    }
+
+    // 101 Switching Protocols. Take the upstream-side upgrade handle and copy
+    // the handshake response headers back to the agent (minus the ones we
+    // strip everywhere), then splice once both ends have upgraded.
+    let upstream_upgrade = hyper::upgrade::on(&mut upstream_response);
+    let mut out_headers = upstream_response.headers().clone();
+    for h in STRIPPED_RESPONSE_HEADERS {
+        out_headers.remove(*h);
+    }
+
+    let audit = Arc::clone(&server.audit);
+    tokio::spawn(async move {
+        let (agent_io, upstream_io) = match (agent_upgrade.await, upstream_upgrade.await) {
+            (Ok(a), Ok(u)) => (a, u),
+            (a, u) => {
+                eprintln!(
+                    "websocket upgrade did not complete (agent ok: {}, upstream ok: {})",
+                    a.is_ok(),
+                    u.is_ok()
+                );
+                return;
+            }
+        };
+        let mut agent_io = TokioIo::new(agent_io);
+        let mut upstream_io = TokioIo::new(upstream_io);
+        // copy_bidirectional returns (a->b, b->a): (agent->upstream uploaded,
+        // upstream->agent returned), matching bytes_in / bytes_out elsewhere.
+        let (bytes_in, bytes_out) = match copy_bidirectional(&mut agent_io, &mut upstream_io).await {
+            Ok(counts) => counts,
+            Err(e) => {
+                eprintln!("websocket relay ended with error: {}", e);
+                (0, 0)
+            }
+        };
+        let rec = Record {
+            ts: audit::now_rfc3339(),
+            cred: Some(&cred_name),
+            host: &target_host,
+            method: &method,
+            path: &path,
+            status: StatusCode::SWITCHING_PROTOCOLS.as_u16(),
+            bytes_in,
+            bytes_out,
+            ms: started.elapsed().as_millis() as u64,
+            decision: "allow",
+            reason: None,
+            protocol: Some("websocket"),
+        };
+        if let Err(e) = audit.write(&rec) {
+            eprintln!("audit write failed for websocket relay: {}", e);
+        }
+    });
+
+    let mut resp = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    if let Some(h) = resp.headers_mut() {
+        *h = out_headers;
+    }
+    resp.body(empty_body()).expect("101 response build")
+}
+
+/// Relay an ordinary upstream response back to the agent: strip the sensitive
+/// response headers, wrap the body so bytes are counted, and write the audit
+/// line at end-of-stream. Shared by the normal request path and the
+/// non-101 branch of an upgrade attempt.
+#[allow(clippy::too_many_arguments)]
+fn finish_response(
+    server: &Server,
+    upstream_response: Response<Incoming>,
+    cred: String,
+    host: String,
+    method: String,
+    path: String,
+    bytes_in: Arc<AtomicU64>,
+    started: Instant,
+) -> Response<ProxyBody> {
     let (resp_parts, resp_body) = upstream_response.into_parts();
     let mut out_headers = resp_parts.headers.clone();
     for h in STRIPPED_RESPONSE_HEADERS {
@@ -294,12 +485,12 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
     let on_end = build_audit_callback(AuditCtx {
         audit: Arc::clone(&server.audit),
         started,
-        cred: cred_name,
-        host: target_host,
-        method: method.as_str().to_string(),
-        path: path_and_query,
+        cred,
+        host,
+        method,
+        path,
         status: status.as_u16(),
-        bytes_in: Arc::clone(&bytes_in_counter),
+        bytes_in,
         bytes_out: Arc::clone(&bytes_out_counter),
     });
     let resp_body = Counting {
@@ -313,6 +504,12 @@ async fn serve(server: Server, req: Request<Incoming>) -> Response<ProxyBody> {
         *h = out_headers;
     }
     resp.body(resp_body.boxed()).expect("response build")
+}
+
+/// An empty `ProxyBody`, used for the 101 response we hand back on a successful
+/// WebSocket upgrade (the bytes after the handshake are spliced, not bodied).
+fn empty_body() -> ProxyBody {
+    Empty::<Bytes>::new().map_err(|e: Infallible| match e {}).boxed()
 }
 
 /// Pull the upstream host out of an absolute-form URI authority, or fall
@@ -381,7 +578,7 @@ where
                 .await
                 .map_err(|e| format!("h1 handshake: {}", e))?;
             tokio::spawn(async move {
-                let _ = conn.await;
+                let _ = conn.with_upgrades().await;
             });
             sender
                 .send_request(req)
@@ -393,7 +590,7 @@ where
                 .await
                 .map_err(|e| format!("h1 handshake: {}", e))?;
             tokio::spawn(async move {
-                let _ = conn.await;
+                let _ = conn.with_upgrades().await;
             });
             sender
                 .send_request(req)
@@ -452,6 +649,7 @@ fn deny(
         ms: started.elapsed().as_millis() as u64,
         decision: "deny",
         reason,
+        protocol: None,
     };
     if let Err(e) = server.audit.write(&rec) {
         return fail_closed_audit(e);
@@ -681,6 +879,7 @@ fn build_audit_callback(ctx: AuditCtx) -> Box<dyn FnOnce() + Send + Sync> {
             ms: ctx.started.elapsed().as_millis() as u64,
             decision: "allow",
             reason: None,
+            protocol: None,
         };
         if let Err(e) = ctx.audit.write(&rec) {
             eprintln!("audit write failed mid-stream: {}", e);

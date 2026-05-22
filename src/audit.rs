@@ -32,6 +32,10 @@ pub struct Record<'a> {
     pub decision: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'a str>,
+    /// Application protocol when it isn't plain request/response — currently
+    /// only `"websocket"` for a spliced Upgrade relay. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<&'static str>,
 }
 
 pub struct Audit {
@@ -124,6 +128,7 @@ mod tests {
             ms: 0,
             decision,
             reason: None,
+            protocol: None,
         }
     }
 

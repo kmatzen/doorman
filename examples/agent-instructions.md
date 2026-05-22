@@ -73,6 +73,15 @@ const r = await fetch(
 );
 ```
 
+### WebSockets
+
+WebSocket endpoints work through doorman too. Use a `ws://` URL (not
+`wss://`) and set `X-Doorman-Cred` like any other request; doorman injects
+the credential on the upgrade handshake and relays the socket. Your
+WebSocket client must connect through the same proxy
+(`http://127.0.0.1:18443`) — most honor the `HTTP_PROXY` environment
+variable.
+
 ### Don't
 
 - Don't try to read or echo the secret. Doorman never reveals it; only
