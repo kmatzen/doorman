@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "doorman"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "http-body",
  "http-body-util",
