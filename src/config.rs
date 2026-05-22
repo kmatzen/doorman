@@ -110,7 +110,23 @@ pub fn load(path: &Path, enforce_mode_0400: bool) -> Result<Config, String> {
             ));
         }
     }
-    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let raw = fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            // The usual cause under a service: the config is owned by root (or
+            // some other uid) but the daemon runs as a dedicated, unprivileged
+            // uid that can't read it. Spell that out — it's exactly the failure
+            // that otherwise shows up as a bare "exit 1" in the service log.
+            format!(
+                "read {}: {} — the config must be owned by and readable by the uid \
+                 doorman runs as (under the systemd unit / launchd plist that is a \
+                 dedicated uid, not root); check the file's owner and mode",
+                path.display(),
+                e
+            )
+        } else {
+            format!("read {}: {}", path.display(), e)
+        }
+    })?;
     let entries: Vec<RawEntry> = serde_yaml::from_str(&raw).map_err(|e| format!("parse: {}", e))?;
     if entries.is_empty() {
         return Err("config has no entries; refusing to start".into());
@@ -437,5 +453,28 @@ mod tests {
         let cfg = load(&p, false).unwrap();
         assert!(cfg.entries[0].tls_pin.is_none());
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn unreadable_config_explains_uid_permission() {
+        // root ignores permission bits, so this scenario only holds for an
+        // unprivileged uid — which is exactly how the daemon runs as a service.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // enforce_mode_0400 = false so we get past the mode gate to the read,
+        // which then fails as PermissionDenied (the #10 failure mode).
+        let err = load(&p, false).unwrap_err();
+        // Restore perms so cleanup can remove the file.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).ok();
+        std::fs::remove_file(&p).ok();
+        assert!(
+            err.contains("readable by the uid"),
+            "expected a uid/permission hint, got: {}",
+            err
+        );
     }
 }

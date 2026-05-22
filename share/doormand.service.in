@@ -3,7 +3,7 @@ Description=doorman HTTP credential proxy
 After=network.target
 
 [Service]
-ExecStart=__BIN_PATH__ run
+ExecStart=__BIN_PATH__ run --config /etc/doorman/doorman.yaml --audit /var/log/doorman/audit.log
 User=doorman
 Group=doorman
 NoNewPrivileges=true

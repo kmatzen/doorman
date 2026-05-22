@@ -115,19 +115,27 @@ cat <<DONE
 Installed.
 
 Next steps:
-  1. Write your config:
+  1. Write your config (it must end up readable by the ${USER_NAME} uid):
        sudo -u ${USER_NAME} touch ${ETC_DIR}/doorman.yaml
-       sudo chmod 0400 ${ETC_DIR}/doorman.yaml
        sudoedit ${ETC_DIR}/doorman.yaml
+       # Belt and suspenders, regardless of how you edited it: make sure the
+       # daemon's uid owns the file and nobody else can read it.
+       sudo chown ${USER_NAME}:${GROUP_NAME} ${ETC_DIR}/doorman.yaml
+       sudo chmod 0400 ${ETC_DIR}/doorman.yaml
 
   2. Start the daemon:
        sudo launchctl bootstrap system ${PLIST}
 
   3. Verify it's listening:
-       lsof -nP -iTCP:8443 -sTCP:LISTEN
+       lsof -nP -iTCP:18443 -sTCP:LISTEN
 
   4. Tail the audit log:
        sudo tail -f ${LOG_DIR}/audit.log
+
+If the service does not come up, read the startup error:
+       sudo tail -n 20 ${LOG_DIR}/stderr.log
+  The most common cause is a config the ${USER_NAME} uid cannot read
+  (root-owned or wrong mode) — re-run the chown/chmod from step 1.
 
 To uninstall, see the comment at the top of this script.
 DONE

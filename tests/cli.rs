@@ -104,3 +104,22 @@ fn validate_config_enforces_mode_0400_unless_flag_given() {
     assert!(stderr.contains("0400"), "expected a mode-0400 error, got: {}", stderr);
     std::fs::remove_file(&p).ok();
 }
+
+#[test]
+fn install_service_emits_explicit_config_and_audit_paths() {
+    // The emitted service definition (systemd unit on Linux, launchd plist on
+    // macOS) must invoke `run` with explicit --config/--audit rather than the
+    // bare `run` that left operators guessing (#10). The check is the same on
+    // both platforms because both templates embed these literals.
+    let out = doormand()
+        .args(["install-service", "--bin-path", "/usr/local/bin/doormand"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "install-service failed: {:?}", out.status);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("/usr/local/bin/doormand"), "bin path missing:\n{}", s);
+    assert!(s.contains("--config"), "missing --config:\n{}", s);
+    assert!(s.contains("/etc/doorman/doorman.yaml"), "missing config path:\n{}", s);
+    assert!(s.contains("--audit"), "missing --audit:\n{}", s);
+    assert!(s.contains("/var/log/doorman/audit.log"), "missing audit path:\n{}", s);
+}
