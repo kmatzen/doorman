@@ -8,6 +8,10 @@
     <array>
         <string>__BIN_PATH__</string>
         <string>run</string>
+        <string>--config</string>
+        <string>/etc/doorman/doorman.yaml</string>
+        <string>--audit</string>
+        <string>/var/log/doorman/audit.log</string>
     </array>
     <key>UserName</key>
     <string>_doorman</string>

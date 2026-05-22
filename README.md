@@ -119,6 +119,14 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.doorman.doormand.plis
 
 macOS's hardening primitives are weaker than systemd's; `_doorman` runs as a separate uid but you don't get the equivalent of `NoNewPrivileges` etc.
 
+> **Service won't start (exits 1)?** The daemon runs as a dedicated uid (`_doorman` on macOS, `doorman` on Linux), so the config must be **owned by and readable by that uid**. A root-owned `0400` file fails with `read …: Permission denied` and the daemon exits 1. The error is in the service's stderr log:
+>
+> ```
+> sudo tail -n 20 /var/log/doorman/stderr.log
+> ```
+>
+> Fix it by giving the file to the daemon's uid: `sudo chown _doorman:_doorman /etc/doorman/doorman.yaml && sudo chmod 0400 /etc/doorman/doorman.yaml` (use `doorman:doorman` on Linux). The emitted launchd plist and systemd unit pass `--config /etc/doorman/doorman.yaml --audit /var/log/doorman/audit.log` explicitly, so this is the same config `doormand validate-config` checks.
+
 ### Run directly (development)
 
 ```
