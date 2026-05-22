@@ -1,6 +1,6 @@
 [package]
 name = "doorman"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "An HTTPS proxy that holds your API keys and refuses to send them anywhere they don't belong."
 license = "MIT"
