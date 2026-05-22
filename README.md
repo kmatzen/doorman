@@ -40,7 +40,9 @@ brew tap kmatzen/doorman
 brew install doorman
 ```
 
-`brew info doorman` prints the config-file setup steps. Note: brew runs doorman under your user uid; for hardened production deployment with uid separation, use the systemd unit (Linux) or `install-darwin.sh` (macOS) — see [From a release tarball](#from-a-release-tarball) below.
+`brew info doorman` prints the config-file setup steps.
+
+> **The brew install is convenience-tier, not an isolation boundary.** It runs doorman under *your* user uid and the config is owned by you. Mode 0400 stops *other* users from reading it, but it does **not** isolate the secrets from other code running as you: any process with your uid can read the file, and (since you own it) can `chmod u+w` and rewrite it. For a real boundary — doorman running under a dedicated, unprivileged uid that your app code never runs as — use the systemd unit (Linux, `User=doorman`) or `install-darwin.sh` (macOS, creates `_doorman`); see [From a release tarball](#from-a-release-tarball) below. Either way, a restart records a config fingerprint in the [audit log](#audit-log), so out-of-band edits are at least visible.
 
 ### Quick install (curl)
 
@@ -265,6 +267,12 @@ One JSON line per request, fsync'd. Default path `/var/log/doorman/audit.log`, m
 
 No bodies, no headers, no secrets.
 
+At startup (and on any restart, which is how config changes take effect) doorman also writes one **config-load** line: a SHA-256 of the config file plus the credential names it defines — no secrets. Because edits happen out-of-band, this is where a config change shows up in the trail; a changed `config_sha256` between restarts means the credential set was edited.
+
+```json
+{"ts":"2026-05-22T14:53:01Z","event":"config_load","config_sha256":"9f2b…","credentials":["github","stripe"]}
+```
+
 **Rotation.** Doorman handles `SIGHUP` by re-opening the audit log file at the same path, so external rotators (logrotate, newsyslog) can move the current file aside and signal doorman to start writing a fresh one. Example logrotate stanza:
 
 ```
@@ -298,7 +306,7 @@ Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the
 2. **Destination binding.** A secret is only ever sent to a host (and optionally method) explicitly allowlisted for it. Host comes from the request URI authority or `Host` header, lowercased, and exact-matched against the allowlist. Redirects are not followed; 3xx responses are returned to the agent verbatim.
 3. **Non-repudiation.** Every request — allow or deny — produces an audit-log line, fsync'd. Denies are logged before the response is sent; allows are logged at end-of-stream.
 4. **Process isolation.** With the systemd unit, doorman runs under a different uid from the agent, with `NoNewPrivileges`, no ambient capabilities, and `PR_SET_DUMPABLE=0` (no core dumps, no ptrace from same-uid processes).
-5. **Config confidentiality at rest.** The config file is mode 0400, owned by the doorman uid; doorman refuses to start otherwise (unless `--insecure-skip-mode-check`).
+5. **Config confidentiality at rest — between *uids*.** The config file is mode 0400, owned by the doorman uid; doorman refuses to start otherwise (unless `--insecure-skip-mode-check`). This keeps the secrets away from *other* users and from group/world, but 0400 is only advisory against the *owning* uid — that uid can read the file and can `chmod` it writable. The boundary is therefore only as strong as the separation between doorman's uid and the agent's: real isolation requires running doorman under a **dedicated** uid the agent never runs as (the systemd unit's `User=doorman`, or `_doorman` from `install-darwin.sh`). The convenience brew install, which runs doorman as your own uid, provides **no** isolation from other code running as you — see [Homebrew](#homebrew-macos--linux). A config-load line in the audit log fingerprints the file at each start so out-of-band edits are detectable.
 
 ### Out of scope
 

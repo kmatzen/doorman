@@ -301,6 +301,28 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let upstream_tls_pinned = proxy::upstream_tls_pinned(&cfg);
     let audit = Arc::new(audit::Audit::open(&audit_path)?);
 
+    // Record the loaded config in the audit trail: a SHA-256 of the file plus
+    // the credential names it defines (never the secrets). Config edits happen
+    // out-of-band — the file is mode 0400 and, depending on install tier, the
+    // owning uid can rewrite it — so this is where a change becomes visible.
+    // Best-effort: a failure here is logged but doesn't block startup, since
+    // per-request auditing is the fail-closed path.
+    match std::fs::read(&config_path) {
+        Ok(bytes) => {
+            let fingerprint = proxy::hex(&proxy::sha256(&bytes));
+            let names: Vec<String> = cfg.entries.iter().map(|e| e.name.clone()).collect();
+            if let Err(e) = audit.write_config_load(&audit::ConfigLoad {
+                ts: audit::now_rfc3339(),
+                event: "config_load",
+                config_sha256: &fingerprint,
+                credentials: &names,
+            }) {
+                eprintln!("doormand: audit config_load write failed: {}", e);
+            }
+        }
+        Err(e) => eprintln!("doormand: could not re-read config for audit fingerprint: {}", e),
+    }
+
     let server = proxy::Server {
         config: Arc::new(cfg),
         audit: Arc::clone(&audit),
