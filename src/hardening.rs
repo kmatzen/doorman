@@ -108,9 +108,10 @@ mod tests {
         assert!(w.contains("SECURITY"), "got: {}", w);
         assert!(w.contains("--allow-same-uid"), "got: {}", w);
         assert!(w.contains("issues/39"), "got: {}", w);
-        // A typical Linux login uid.
+        // Anything at or above the platform floor is a login account. 1000 is
+        // >= the floor on both platforms (Linux 1000, macOS 500); the floor+1
+        // check exercises whichever cutoff this build uses.
         assert!(login_uid_warning(1000).is_some());
-        // A typical macOS login uid.
-        assert!(login_uid_warning(501).is_some());
+        assert!(login_uid_warning(login_uid_min() + 1).is_some());
     }
 }
