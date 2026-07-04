@@ -3,11 +3,12 @@
 // output. The security-relevant property — that a secret value never appears
 // in the command's output — gets its own assertion.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 fn doormand() -> Command {
     Command::new(env!("CARGO_BIN_EXE_doormand"))
@@ -102,6 +103,67 @@ fn validate_config_enforces_mode_0400_unless_flag_given() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("0400"), "expected a mode-0400 error, got: {}", stderr);
+    std::fs::remove_file(&p).ok();
+}
+
+/// Boot `doormand run` on a throwaway port, let it print its startup
+/// diagnostics, then kill it and return its stderr. `extra` lets a caller add
+/// flags such as `--allow-same-uid`.
+fn run_and_capture_stderr(config: &std::path::Path, port: u16, extra: &[&str]) -> String {
+    let audit = std::env::temp_dir().join(format!("doorman_cli_run_{}_{}.log", std::process::id(), port));
+    let mut cmd = doormand();
+    cmd.args(["run", "--config"])
+        .arg(config)
+        .args(["--audit"])
+        .arg(&audit)
+        .args(["--listen", &format!("127.0.0.1:{}", port)])
+        .args(extra)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    // Startup diagnostics (the posture warning and the "listening" line) are
+    // emitted synchronously before the daemon blocks on the accept loop, so a
+    // short pause is enough to capture them.
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = child.kill();
+    let mut stderr = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut stderr);
+    }
+    let _ = child.wait();
+    std::fs::remove_file(&audit).ok();
+    stderr
+}
+
+#[test]
+fn run_warns_about_same_uid_exposure_and_flag_silences_it() {
+    // The posture warning keys off the login-uid range; a service account
+    // (or root) is the separated, safe posture and is intentionally not
+    // flagged, so skip the assertion there rather than fail spuriously.
+    let euid = unsafe { libc::geteuid() };
+    let login_floor: u32 = if cfg!(target_os = "macos") { 500 } else { 1000 };
+    if euid == 0 || euid < login_floor {
+        return;
+    }
+    let p = write_tmp(
+        "run_uid",
+        "- name: github\n  secret: ghp_x\n  inject: 'Authorization: Bearer {}'\n  hosts: [api.github.com]\n",
+    );
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+    let warned = run_and_capture_stderr(&p, 18991, &[]);
+    assert!(
+        warned.contains("SECURITY") && warned.contains("issues/39"),
+        "expected a same-UID posture warning, got: {}",
+        warned
+    );
+
+    let silenced = run_and_capture_stderr(&p, 18992, &["--allow-same-uid"]);
+    assert!(
+        !silenced.contains("SECURITY"),
+        "--allow-same-uid should suppress the warning, got: {}",
+        silenced
+    );
     std::fs::remove_file(&p).ok();
 }
 

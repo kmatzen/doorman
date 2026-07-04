@@ -106,11 +106,19 @@ Write a config (mode 0400, owned by the doorman uid) — see [Config](#config). 
 **Linux (systemd):**
 
 ```
+# 1. Create the dedicated service account the unit runs as. This is the
+#    isolation boundary — doorman must NOT run as your login user (see below).
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin doorman
+
+# 2. Config + log dirs, owned by that account.
+sudo install -d -o doorman -g doorman -m 0750 /etc/doorman /var/log/doorman
+
+# 3. Install and start the unit.
 doormand install-service | sudo tee /etc/systemd/system/doormand.service
 sudo systemctl enable --now doormand
 ```
 
-The unit runs doorman as `User=doorman`, with `NoNewPrivileges`, dropped capabilities, and `PR_SET_DUMPABLE=0`.
+The unit runs doorman as `User=doorman`, with `NoNewPrivileges`, dropped capabilities, and `PR_SET_DUMPABLE=0`. Write your config to `/etc/doorman/doorman.yaml`, `sudo chown doorman:doorman` it, and `sudo chmod 0400` it before starting.
 
 **macOS (launchd):** use the install script — it creates the `_doorman` user/group, the directories, and writes the plist:
 
@@ -306,7 +314,7 @@ Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the
 2. **Destination binding.** A secret is only ever sent to a host (and optionally method) explicitly allowlisted for it. Host comes from the request URI authority or `Host` header, lowercased, and exact-matched against the allowlist. Redirects are not followed; 3xx responses are returned to the agent verbatim.
 3. **Non-repudiation.** Every request — allow or deny — produces an audit-log line, fsync'd. Denies are logged before the response is sent; allows are logged at end-of-stream.
 4. **Process isolation.** With the systemd unit, doorman runs under a different uid from the agent, with `NoNewPrivileges`, no ambient capabilities, and `PR_SET_DUMPABLE=0` (no core dumps, no ptrace from same-uid processes).
-5. **Config confidentiality at rest — between *uids*.** The config file is mode 0400, owned by the doorman uid; doorman refuses to start otherwise (unless `--insecure-skip-mode-check`). This keeps the secrets away from *other* users and from group/world, but 0400 is only advisory against the *owning* uid — that uid can read the file and can `chmod` it writable. The boundary is therefore only as strong as the separation between doorman's uid and the agent's: real isolation requires running doorman under a **dedicated** uid the agent never runs as (the systemd unit's `User=doorman`, or `_doorman` from `install-darwin.sh`). The convenience brew install, which runs doorman as your own uid, provides **no** isolation from other code running as you — see [Homebrew](#homebrew-macos--linux). A config-load line in the audit log fingerprints the file at each start so out-of-band edits are detectable.
+5. **Config confidentiality at rest — between *uids*.** The config file is mode 0400, owned by the doorman uid; doorman refuses to start otherwise (unless `--insecure-skip-mode-check`). This keeps the secrets away from *other* users and from group/world, but 0400 is only advisory against the *owning* uid — that uid can read the file and can `chmod` it writable. The boundary is therefore only as strong as the separation between doorman's uid and the agent's: real isolation requires running doorman under a **dedicated** uid the agent never runs as (the systemd unit's `User=doorman`, or `_doorman` from `install-darwin.sh`). The convenience brew install, which runs doorman as your own uid, provides **no** isolation from other code running as you — see [Homebrew](#homebrew-macos--linux). To keep this from being a silent trap, `doormand run` prints a prominent warning at startup whenever it detects it is running under a personal login uid (rather than a dedicated service account); pass `--allow-same-uid` to acknowledge and silence it once you've made an informed choice. A config-load line in the audit log fingerprints the file at each start so out-of-band edits are detectable.
 
 ### Out of scope
 

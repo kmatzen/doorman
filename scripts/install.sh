@@ -91,4 +91,16 @@ else
 fi
 
 log "installed: $PREFIX/doormand"
-log "next: write a config (see https://github.com/$REPO#config) and start the service."
+log ""
+log "next: write a config (see https://github.com/$REPO#config)."
+log ""
+log "IMPORTANT — run doormand under a DEDICATED service uid, not your login user."
+log "  The config holds secrets in plaintext; file permissions keep *other* users out"
+log "  but do NOT isolate the secrets from other code (shells, cron, AI agents) running"
+log "  as the same uid, which bypasses the proxy entirely (see issue #39). Use the"
+log "  service install path, which runs doorman as its own uid:"
+log "    Linux:  doormand install-service > /etc/systemd/system/doormand.service   (User=doorman;"
+log "            create it first: sudo useradd --system --no-create-home --shell /usr/sbin/nologin doorman)"
+log "    macOS:  sudo bash scripts/install-darwin.sh   (creates the _doorman account for you)"
+log "  If you start doormand as your own login user anyway, it will warn at each start;"
+log "  pass 'run --allow-same-uid' to acknowledge and silence that warning."
