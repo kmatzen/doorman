@@ -5,9 +5,11 @@
 //       a systemd unit on Linux, a launchd plist on macOS. (Just prints;
 //       the operator redirects it where they want it.)
 //
-//   doormand run [--config PATH] [--audit PATH] [--listen ADDR]
+//   doormand run [--config PATH] [--audit PATH] [--listen ADDR] [--allow-same-uid]
 //       The actual proxy. Refuses to start if any of: config missing/looser
-//       than 0400, audit log unwritable.
+//       than 0400, audit log unwritable. Warns at startup if it is running
+//       under a personal login uid (the same-UID exposure of issue #39);
+//       --allow-same-uid silences that warning for the convenience tier.
 //
 //   doormand validate-config [--config PATH] [--insecure-skip-mode-check]
 //       Run the same config validation `run` does, then exit — without
@@ -26,7 +28,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use doorman::{audit, config, proxy};
+use doorman::{audit, config, hardening, proxy};
 
 const DEFAULT_CONFIG: &str = "/etc/doorman/doorman.yaml";
 const DEFAULT_AUDIT: &str = "/var/log/doorman/audit.log";
@@ -65,7 +67,7 @@ fn print_usage() {
         "doormand — an HTTP proxy that holds your API keys.\n\n\
          usage:\n  \
            doormand install-service [--bin-path PATH]\n  \
-           doormand run [--config PATH] [--audit PATH] [--listen ADDR]\n  \
+           doormand run [--config PATH] [--audit PATH] [--listen ADDR] [--allow-same-uid]\n  \
            doormand validate-config [--config PATH] [--insecure-skip-mode-check]\n  \
            doormand fingerprint <host[:port]>\n"
     );
@@ -271,6 +273,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .parse()
         .map_err(|e| format!("default listen addr: {}", e))?;
     let mut enforce_0400 = true;
+    let mut allow_same_uid = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -278,6 +281,10 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             "--config" => {
                 config_path = PathBuf::from(args.get(i + 1).ok_or("missing value for --config")?);
                 i += 2;
+            }
+            "--allow-same-uid" => {
+                allow_same_uid = true;
+                i += 1;
             }
             "--audit" => {
                 audit_path = PathBuf::from(args.get(i + 1).ok_or("missing value for --audit")?);
@@ -297,6 +304,18 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 
     let cfg = config::load(&config_path, enforce_0400)?;
+
+    // Posture check (issue #39): if the daemon is running under a personal
+    // login uid, the plaintext config is readable by anything else sharing
+    // that uid and the broker indirection is bypassed at rest. Warn loudly —
+    // this goes to the service's stderr log on every start — unless the
+    // operator has explicitly accepted the convenience-tier posture.
+    if !allow_same_uid {
+        if let Some(warning) = hardening::login_uid_warning(hardening::current_euid()) {
+            eprintln!("doormand: {}", warning);
+        }
+    }
+
     let upstream_tls = proxy::upstream_tls();
     let upstream_tls_pinned = proxy::upstream_tls_pinned(&cfg);
     let audit = Arc::new(audit::Audit::open(&audit_path)?);
