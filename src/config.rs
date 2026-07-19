@@ -63,7 +63,9 @@ impl Entry {
     /// Render the full header value the upstream will see. Pulled out so the
     /// proxy and the tests share one definition.
     pub fn render(&self) -> String {
-        let mut s = String::with_capacity(self.header_prefix.len() + self.secret.len() + self.header_suffix.len());
+        let mut s = String::with_capacity(
+            self.header_prefix.len() + self.secret.len() + self.header_suffix.len(),
+        );
         s.push_str(&self.header_prefix);
         s.push_str(&self.secret);
         s.push_str(&self.header_suffix);
@@ -232,7 +234,13 @@ fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
     let tls_pin = match r.tls_pinned_sha256.as_deref() {
         None | Some("") => None,
         Some(hex) => Some(parse_pin_hex(hex).map_err(|e| {
-            format!("{} {:?}: tls_pinned_sha256 {:?}: {}", where_(), r.name, hex, e)
+            format!(
+                "{} {:?}: tls_pinned_sha256 {:?}: {}",
+                where_(),
+                r.name,
+                hex,
+                e
+            )
         })?),
     };
     if !tls && tls_pin.is_some() {
@@ -286,7 +294,9 @@ fn hex_nibble(b: u8) -> Result<u8, &'static str> {
 /// `("Authorization", "Bearer ", "")`. Exactly one `{}` slot, exactly one
 /// colon separating header name from value template.
 fn parse_inject(s: &str) -> Result<(String, String, String), String> {
-    let colon = s.find(':').ok_or("missing ':' between header name and value")?;
+    let colon = s
+        .find(':')
+        .ok_or("missing ':' between header name and value")?;
     let name = s[..colon].trim();
     if name.is_empty() {
         return Err("header name is empty".into());
@@ -298,14 +308,18 @@ fn parse_inject(s: &str) -> Result<(String, String, String), String> {
 
     let slot_count = value.matches("{}").count();
     if slot_count != 1 {
-        return Err(format!("value template must contain exactly one '{{}}' slot, found {}", slot_count));
+        return Err(format!(
+            "value template must contain exactly one '{{}}' slot, found {}",
+            slot_count
+        ));
     }
     let slot = value.find("{}").unwrap();
     let prefix = &value[..slot];
     let suffix = &value[slot + 2..];
 
     // Reject any other braces; the template is dead-simple by design.
-    if prefix.contains('{') || prefix.contains('}') || suffix.contains('{') || suffix.contains('}') {
+    if prefix.contains('{') || prefix.contains('}') || suffix.contains('{') || suffix.contains('}')
+    {
         return Err("value template may only contain a single '{}' slot".into());
     }
 
@@ -318,7 +332,26 @@ fn is_name_char(c: char) -> bool {
 
 fn is_header_name_char(c: char) -> bool {
     // RFC 7230 token: very permissive but excludes whitespace/control/separators.
-    c.is_ascii_graphic() && !matches!(c, '(' | ')' | ',' | '/' | ':' | ';' | '<' | '=' | '>' | '?' | '@' | '[' | '\\' | ']' | '{' | '}' | '"')
+    c.is_ascii_graphic()
+        && !matches!(
+            c,
+            '(' | ')'
+                | ','
+                | '/'
+                | ':'
+                | ';'
+                | '<'
+                | '='
+                | '>'
+                | '?'
+                | '@'
+                | '['
+                | '\\'
+                | ']'
+                | '{'
+                | '}'
+                | '"'
+        )
 }
 
 /// Any RFC 9110 token is a legitimate HTTP method name — this used to allow
@@ -406,7 +439,8 @@ mod tests {
 
     #[test]
     fn rejects_host_with_scheme() {
-        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['https://a.com']\n");
+        let p =
+            write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['https://a.com']\n");
         assert!(load(&p, false).unwrap_err().contains("bare hostname"));
         std::fs::remove_file(&p).ok();
     }
@@ -459,7 +493,9 @@ mod tests {
 
     #[test]
     fn methods_uppercased_and_validated() {
-        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [get, post]\n");
+        let p = write_tmp(
+            "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [get, post]\n",
+        );
         let cfg = load(&p, false).unwrap();
         let e = &cfg.entries[0];
         assert!(e.method_allowed("GET"));

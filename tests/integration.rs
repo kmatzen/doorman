@@ -160,10 +160,7 @@ async fn spawn_mock_upstream(server_tls: Arc<rustls::ServerConfig>) -> (SocketAd
 // Doorman under test: bind on a random port, serve in a background task.
 // --------------------------------------------------------------------------
 
-async fn spawn_doorman(
-    entries: Vec<Entry>,
-    upstream_tls: Arc<rustls::ClientConfig>,
-) -> SocketAddr {
+async fn spawn_doorman(entries: Vec<Entry>, upstream_tls: Arc<rustls::ClientConfig>) -> SocketAddr {
     spawn_doorman_full(entries, upstream_tls, Arc::new(HashMap::new())).await
 }
 
@@ -176,8 +173,8 @@ async fn spawn_doorman_full(
     let i = N.fetch_add(1, Ordering::Relaxed);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let audit_path = std::env::temp_dir()
-        .join(format!("doorman_int_{}_{}.log", std::process::id(), i));
+    let audit_path =
+        std::env::temp_dir().join(format!("doorman_int_{}_{}.log", std::process::id(), i));
     let _ = std::fs::remove_file(&audit_path);
     let audit = Audit::open(&audit_path).expect("open audit log");
     let server = Server {
@@ -235,7 +232,11 @@ fn parse_inject(s: &str) -> (String, String, String) {
     let name = s[..colon].trim().to_string();
     let value = s[colon + 1..].trim_start();
     let slot = value.find("{}").unwrap();
-    (name, value[..slot].to_string(), value[slot + 2..].to_string())
+    (
+        name,
+        value[..slot].to_string(),
+        value[slot + 2..].to_string(),
+    )
 }
 
 // --------------------------------------------------------------------------
@@ -308,8 +309,14 @@ async fn allow_path_injects_secret_and_strips_cred_header() {
     let req = captured.lock().unwrap().last().cloned().unwrap();
     assert_eq!(req.method, "GET");
     assert_eq!(req.path, "/some/path");
-    assert_eq!(req.headers.get("authorization").map(String::as_str), Some("Bearer SECRET_VALUE"));
-    assert!(!req.headers.contains_key("x-doorman-cred"), "cred header must not leak");
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some("Bearer SECRET_VALUE")
+    );
+    assert!(
+        !req.headers.contains_key("x-doorman-cred"),
+        "cred header must not leak"
+    );
 }
 
 #[tokio::test]
@@ -396,7 +403,10 @@ async fn agent_authorization_header_is_overwritten() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let req = captured.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(req.headers.get("authorization").map(String::as_str), Some("Bearer REAL_SECRET"));
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some("Bearer REAL_SECRET")
+    );
 }
 
 #[tokio::test]
@@ -425,8 +435,13 @@ async fn deny_unknown_credential() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(std::str::from_utf8(&body).unwrap().contains("unknown credential"));
-    assert!(captured.lock().unwrap().is_empty(), "upstream must not be contacted on deny");
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("unknown credential"));
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "upstream must not be contacted on deny"
+    );
 }
 
 #[tokio::test]
@@ -455,7 +470,9 @@ async fn deny_disallowed_host() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(std::str::from_utf8(&body).unwrap().contains("host not allowlisted"));
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("host not allowlisted"));
     assert!(captured.lock().unwrap().is_empty());
 }
 
@@ -485,7 +502,9 @@ async fn deny_disallowed_method() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(std::str::from_utf8(&body).unwrap().contains("method not allowlisted"));
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("method not allowlisted"));
     assert!(captured.lock().unwrap().is_empty());
 }
 
@@ -508,7 +527,9 @@ async fn deny_missing_cred_header() {
 
     let (status, _, body) = request(proxy, Method::GET, "localhost", "/x", vec![]).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(std::str::from_utf8(&body).unwrap().contains("missing X-Doorman-Cred"));
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("missing X-Doorman-Cred"));
     assert!(captured.lock().unwrap().is_empty());
 }
 
@@ -671,8 +692,14 @@ async fn response_strips_set_cookie_and_www_authenticate() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(headers.get("set-cookie").is_none(), "set-cookie should be stripped");
-    assert!(headers.get("www-authenticate").is_none(), "www-authenticate should be stripped");
+    assert!(
+        headers.get("set-cookie").is_none(),
+        "set-cookie should be stripped"
+    );
+    assert!(
+        headers.get("www-authenticate").is_none(),
+        "www-authenticate should be stripped"
+    );
     assert_eq!(
         headers.get("x-canary").map(|v| v.to_str().unwrap()),
         Some("untouched"),
@@ -899,8 +926,8 @@ fn fresh_self_signed(hostname: &str) -> (Arc<rustls::ServerConfig>, Vec<u8>) {
     let leaf = params.self_signed(&leaf_key).expect("self-sign leaf");
     let leaf_der = leaf.der().to_vec();
     let cert_der = rustls::pki_types::CertificateDer::from(leaf_der.clone());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
-        .expect("encode key");
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der()).expect("encode key");
     let cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
@@ -1073,10 +1100,11 @@ async fn spawn_ws_mock_upstream(server_tls: Arc<rustls::ServerConfig>) -> (Socke
                         headers.insert(k.trim().to_lowercase(), v.trim().to_string());
                     }
                 }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push(CapturedRequest { method, path, headers });
+                captured.lock().unwrap().push(CapturedRequest {
+                    method,
+                    path,
+                    headers,
+                });
 
                 let resp = "HTTP/1.1 101 Switching Protocols\r\n\
                             Upgrade: websocket\r\n\
@@ -1161,7 +1189,11 @@ async fn websocket_upgrade_relays_splices_and_injects_credential() {
 
     // doorman returns 101, stripped of sensitive response headers.
     let head = read_head(&mut stream).await;
-    assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {:?}", head);
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected 101, got: {:?}",
+        head
+    );
     assert!(
         !head.to_lowercase().contains("set-cookie"),
         "set-cookie must be stripped from the 101: {:?}",
@@ -1217,7 +1249,11 @@ async fn websocket_upgrade_to_disallowed_host_is_denied() {
         .unwrap();
 
     let head = read_head(&mut stream).await;
-    assert!(head.starts_with("HTTP/1.1 403"), "expected 403, got: {:?}", head);
+    assert!(
+        head.starts_with("HTTP/1.1 403"),
+        "expected 403, got: {:?}",
+        head
+    );
     assert!(
         captured.lock().unwrap().is_empty(),
         "upstream must not be contacted when the host is denied"
