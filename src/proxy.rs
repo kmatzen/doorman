@@ -60,7 +60,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
 use crate::audit::{self, Audit, Record};
-use crate::config::{Config, Entry};
+use crate::config::{canonicalize_host, Config, Entry};
 
 /// Headers stripped from every upstream response before it goes back to the
 /// agent. Some upstreams put session material in these on auth errors.
@@ -263,7 +263,7 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
     parts.headers.insert(inject_name, inject_value);
     parts.headers.insert(
         HOST,
-        HeaderValue::try_from(target_host.as_str()).expect("host header"),
+        HeaderValue::try_from(host_header_value(&target_host)).expect("host header"),
     );
 
     // Force the outgoing URI to origin-form. Upstream HTTP/1.1 origin servers
@@ -513,17 +513,53 @@ fn empty_body() -> ProxyBody {
 }
 
 /// Pull the upstream host out of an absolute-form URI authority, or fall
-/// back to the `Host` header. Strips any port. Lowercased.
+/// back to the `Host` header. Strips any port and any IPv6 brackets, then
+/// canonicalizes (see [`canonicalize_host`]) so a bracketed or
+/// differently-formatted IPv6 literal still matches the config allowlist.
 fn resolve_target_host(req: &Request<Incoming>) -> Option<String> {
-    if let Some(host) = req.uri().host() {
-        return Some(host.to_ascii_lowercase());
+    resolve_target_host_from(req.uri(), req.headers())
+}
+
+/// The actual logic behind [`resolve_target_host`], taking the URI and
+/// headers directly rather than a full `Request<Incoming>` — neither of
+/// which unit tests can construct without a real hyper connection — so it's
+/// testable in isolation.
+fn resolve_target_host_from(uri: &hyper::Uri, headers: &hyper::HeaderMap) -> Option<String> {
+    if let Some(host) = uri.host() {
+        return Some(canonicalize_host(strip_v6_brackets(host)));
     }
-    let host_hdr = req.headers().get(HOST)?.to_str().ok()?;
-    let bare = host_hdr.split(':').next().unwrap_or(host_hdr).trim();
+    let host_hdr = headers.get(HOST)?.to_str().ok()?;
+    let bare = if let Some(rest) = host_hdr.strip_prefix('[') {
+        // Bracketed IPv6 literal, optionally followed by `:port`.
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host_hdr.split(':').next().unwrap_or(host_hdr)
+    }
+    .trim();
     if bare.is_empty() {
         return None;
     }
-    Some(bare.to_ascii_lowercase())
+    Some(canonicalize_host(bare))
+}
+
+/// Strip the `[...]` an IPv6 literal wears in URI-authority and `Host`
+/// syntax, when present. Any other input passes through unchanged.
+fn strip_v6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Format a host for the outgoing `Host` header. RFC 7230 requires an IPv6
+/// literal to be wrapped in `[...]` there — unlike in config or in the
+/// internal comparisons this module does throughout, which use the bare
+/// canonical form. Anything else passes through unchanged.
+fn host_header_value(host: &str) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
 }
 
 /// Look up the agent's credential selection — the `X-Doorman-Cred` header.
@@ -555,10 +591,14 @@ where
     B::Data: Send,
     B::Error: Into<DynErr>,
 {
-    let addr = format!("{}:{}", target_host, entry.port);
-    let tcp = TcpStream::connect(&addr)
+    // Dial via the (host, port) tuple form rather than formatting a single
+    // "host:port" string: for a bare IPv6 literal like `fd00::5`, string
+    // concatenation would produce ambiguous colon soup ("fd00::5:8123").
+    // Rust's resolver accepts a bare (unbracketed) IPv4/IPv6/hostname string
+    // as the host half of this tuple directly.
+    let tcp = TcpStream::connect((target_host, entry.port))
         .await
-        .map_err(|e| format!("dial {}: {}", addr, e))?;
+        .map_err(|e| format!("dial {}:{}: {}", target_host, entry.port, e))?;
 
     // Two transport paths. `entry.tls = true` is the historical case —
     // doorman wraps the TCP stream in TLS using either webpki roots or
@@ -885,4 +925,96 @@ fn build_audit_callback(ctx: AuditCtx) -> Box<dyn FnOnce() + Send + Sync> {
             eprintln!("audit write failed mid-stream: {}", e);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_host(value: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(HOST, HeaderValue::try_from(value).unwrap());
+        h
+    }
+
+    fn origin_form_uri() -> hyper::Uri {
+        "/x".parse().unwrap()
+    }
+
+    #[test]
+    fn strip_v6_brackets_removes_brackets_only_when_present() {
+        assert_eq!(strip_v6_brackets("[fd00::5]"), "fd00::5");
+        assert_eq!(strip_v6_brackets("fd00::5"), "fd00::5");
+        assert_eq!(strip_v6_brackets("example.com"), "example.com");
+        assert_eq!(strip_v6_brackets("[fd00::5"), "[fd00::5", "unclosed bracket left alone");
+    }
+
+    #[test]
+    fn host_header_value_brackets_only_ipv6() {
+        assert_eq!(host_header_value("fd00::5"), "[fd00::5]");
+        assert_eq!(host_header_value("::1"), "[::1]");
+        assert_eq!(host_header_value("192.168.1.1"), "192.168.1.1");
+        assert_eq!(host_header_value("api.github.com"), "api.github.com");
+    }
+
+    #[test]
+    fn resolve_target_host_from_absolute_uri_strips_ipv6_brackets() {
+        let uri: hyper::Uri = "http://[fd00::5]:8123/api/states".parse().unwrap();
+        let headers = hyper::HeaderMap::new();
+        assert_eq!(
+            resolve_target_host_from(&uri, &headers),
+            Some("fd00::5".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_host_from_host_header_bracketed_ipv6_with_port() {
+        let headers = headers_with_host("[fd00::5]:8123");
+        assert_eq!(
+            resolve_target_host_from(&origin_form_uri(), &headers),
+            Some("fd00::5".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_host_from_host_header_bracketed_ipv6_no_port() {
+        let headers = headers_with_host("[fd00::5]");
+        assert_eq!(
+            resolve_target_host_from(&origin_form_uri(), &headers),
+            Some("fd00::5".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_host_from_host_header_canonicalizes_ipv6() {
+        // 0:0:0:0:0:0:0:1 and ::1 are the same address; the Host-header
+        // fallback path must normalize the same way the URI-authority path
+        // and the config loader do, so allowlist matching is consistent
+        // regardless of which form the agent happened to send.
+        let headers = headers_with_host("[0:0:0:0:0:0:0:1]:9000");
+        assert_eq!(
+            resolve_target_host_from(&origin_form_uri(), &headers),
+            Some("::1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_host_from_host_header_plain_hostname_with_port_unaffected() {
+        // Pre-existing behavior for the common (non-IPv6) case must be
+        // unchanged by any of this.
+        let headers = headers_with_host("example.com:8080");
+        assert_eq!(
+            resolve_target_host_from(&origin_form_uri(), &headers),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_target_host_from_host_header_ipv4_with_port_unaffected() {
+        let headers = headers_with_host("192.168.86.188:8123");
+        assert_eq!(
+            resolve_target_host_from(&origin_form_uri(), &headers),
+            Some("192.168.86.188".to_string())
+        );
+    }
 }

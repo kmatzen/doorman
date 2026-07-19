@@ -530,8 +530,16 @@ async fn response_strips_set_cookie_and_www_authenticate() {
 // --------------------------------------------------------------------------
 
 async fn spawn_plaintext_mock_upstream() -> (SocketAddr, Captured) {
-    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spawn_plaintext_mock_upstream_on(listener)
+}
+
+/// Same mock as [`spawn_plaintext_mock_upstream`], but on a caller-supplied
+/// listener — lets a test bind an IPv6 loopback listener itself and decide
+/// what to do if that fails (some sandboxed environments have no IPv6
+/// support at all), rather than this helper unconditionally binding IPv4.
+fn spawn_plaintext_mock_upstream_on(listener: TcpListener) -> (SocketAddr, Captured) {
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
     let addr = listener.local_addr().unwrap();
     let captured_for_server = Arc::clone(&captured);
     tokio::spawn(async move {
@@ -616,6 +624,61 @@ async fn plaintext_upstream_injects_secret_and_skips_tls() {
         !req.headers.contains_key("x-doorman-cred"),
         "cred header must not leak even on plaintext upstream"
     );
+}
+
+#[tokio::test]
+async fn ipv6_loopback_upstream_works_end_to_end() {
+    // Requires the kernel/container to support IPv6 at all -- some
+    // sandboxed environments disable it entirely (AF_INET6 unsupported),
+    // in which case this skips rather than failing. Real hosts and typical
+    // CI runners (including this repo's own ubuntu-latest/macos-latest)
+    // have IPv6 loopback, so this exercises the real dial path there.
+    let listener = match TcpListener::bind("[::1]:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "skipping ipv6_loopback_upstream_works_end_to_end: IPv6 unavailable ({})",
+                e
+            );
+            return;
+        }
+    };
+    let (upstream_addr, captured) = spawn_plaintext_mock_upstream_on(listener);
+
+    let proxy = spawn_doorman(
+        vec![entry_full(
+            "hass6",
+            "ha_tok_v6",
+            "Authorization",
+            &["::1"],
+            &[],
+            upstream_addr.port(),
+            false,
+            None,
+        )],
+        doorman::proxy::upstream_tls(),
+    )
+    .await;
+
+    // The agent's Host header uses bracket notation, as real clients would
+    // for an IPv6 literal (e.g. `curl http://[::1]:PORT/...`).
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "[::1]",
+        "/api/states",
+        vec![("X-Doorman-Cred", "hass6")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"plaintext-ok");
+
+    let req = captured.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some("Bearer ha_tok_v6")
+    );
+    assert!(!req.headers.contains_key("x-doorman-cred"));
 }
 
 // --------------------------------------------------------------------------

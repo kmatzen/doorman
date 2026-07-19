@@ -220,7 +220,7 @@ Fields:
 - **`name`**: what the agent puts in `X-Doorman-Cred`. Unique. ASCII alphanumeric plus `_`, `-`, `.`.
 - **`secret`**: the literal string substituted into the inject template. Doorman doesn't interpret it.
 - **`inject`**: a header template like `Header-Name: prefix {} suffix`. Exactly one `{}` slot.
-- **`hosts`**: upstream-host allowlist. Bare hostnames; match is case-insensitive, exact.
+- **`hosts`**: upstream-host allowlist. Bare hostnames or IPv4 literals (case-insensitive, exact match), or bare IPv6 literals — no brackets (those are wire syntax, e.g. in a `Host` header, not config), no port. Different textual forms of the same IPv6 address (`::1` vs `0:0:0:0:0:0:0:1`) are normalized to the same canonical form at load time, so either matches at request time.
 - **`methods`**: optional HTTP method allowlist. Omitted = any method.
 - **`port`**: optional upstream TCP port. Defaults to 443.
 - **`tls`**: optional boolean. Default `true` — doorman speaks TLS to the upstream, validating the chain against `webpki-roots`. Set to `false` for LAN devices that expose only plain HTTP (e.g. Home Assistant on `http://host:8123`). The agent-to-doorman hop is plaintext loopback either way; this only controls upstream transport.
@@ -246,6 +246,22 @@ Two scopes for the same secret = two entries with different names.
   inject: "X-API-Key: {}"
   hosts: [192.168.86.1]
   tls_pinned_sha256: a7b81034cd439551c50a29b54355254a84942a0a990c1a9e12856c855b64b65f
+
+# A LAN device reachable only over IPv6 (ULA or SLAAC address). Hosts are
+# bare — no brackets — the same as any other entry; the agent still uses
+# bracket notation on the wire (curl example below), which doorman parses.
+- name: hass_v6
+  secret: eyJhbGciOiJIUzI1NiIs...
+  inject: "Authorization: Bearer {}"
+  hosts: [fd00::5]
+  port: 8123
+  tls: false
+```
+
+```
+curl --proxy http://127.0.0.1:18443 \
+     -H 'X-Doorman-Cred: hass_v6' \
+     'http://[fd00::5]:8123/api/states'
 ```
 
 ### Updating a pin after a cert rotation
