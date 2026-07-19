@@ -2,7 +2,7 @@
 name = "doorman"
 version = "0.1.10"
 edition = "2021"
-description = "An HTTPS proxy that holds your API keys and refuses to send them anywhere they don't belong."
+description = "An HTTP proxy that holds your API keys and refuses to send them anywhere they don't belong."
 license = "MIT"
 
 [[bin]]

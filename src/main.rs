@@ -303,6 +303,17 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // Clear the dumpable bit before touching any secret material: without
+    // this, a normally started process defaults to dumpable, so a same-uid
+    // `ptrace` or a crash dump could lift every decrypted secret straight out
+    // of memory. Best-effort on Linux (a no-op on macOS, which has no
+    // equivalent primitive); a failure is logged but does not block startup,
+    // since it is defense-in-depth on top of the uid separation that's the
+    // real boundary.
+    if let Err(e) = hardening::disable_ptrace_and_core_dumps() {
+        eprintln!("doormand: could not disable ptrace/core dumps: {}", e);
+    }
+
     let cfg = config::load(&config_path, enforce_0400)?;
 
     // Posture check (issue #39): if the daemon is running under a personal
