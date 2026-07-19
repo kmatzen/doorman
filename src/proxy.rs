@@ -489,6 +489,16 @@ async fn relay_upgrade(
                     a.is_ok(),
                     u.is_ok()
                 );
+                // We already answered 101 to the agent and the handshake — the
+                // secret it carried — already reached the upstream, so this is
+                // an allowed, credential-bearing request. Without a record
+                // here it would be invisible in the audit trail: "every
+                // request produces a line" would silently not hold for a
+                // handshake that fails to complete after the 101.
+                let rec = incomplete_upgrade_record(&cred_name, &target_host, &method, &path, started);
+                if let Err(e) = audit.write(&rec) {
+                    eprintln!("audit write failed for incomplete websocket upgrade: {}", e);
+                }
                 return;
             }
         };
@@ -527,6 +537,34 @@ async fn relay_upgrade(
         *h = out_headers;
     }
     resp.body(empty_body()).expect("101 response build")
+}
+
+/// The audit record for a WebSocket upgrade that got a 101 from doorman but
+/// then failed to complete (either side's `OnUpgrade` resolved to `Err`)
+/// before any bytes were spliced. Pulled out into a pure function so the
+/// record shape is unit-testable without needing to reproduce the underlying
+/// network race that triggers it.
+fn incomplete_upgrade_record<'a>(
+    cred_name: &'a str,
+    target_host: &'a str,
+    method: &'a str,
+    path: &'a str,
+    started: Instant,
+) -> Record<'a> {
+    Record {
+        ts: audit::now_rfc3339(),
+        cred: Some(cred_name),
+        host: target_host,
+        method,
+        path,
+        status: StatusCode::SWITCHING_PROTOCOLS.as_u16(),
+        bytes_in: 0,
+        bytes_out: 0,
+        ms: started.elapsed().as_millis() as u64,
+        decision: "allow",
+        reason: Some("upgrade did not complete after 101"),
+        protocol: Some("websocket"),
+    }
 }
 
 /// Relay an ordinary upstream response back to the agent: strip the sensitive
@@ -1110,5 +1148,20 @@ mod tests {
             resolve_target_host_from(&origin_form_uri(), &headers),
             Some("192.168.86.188".to_string())
         );
+    }
+
+    #[test]
+    fn incomplete_upgrade_record_shape() {
+        let rec = incomplete_upgrade_record("mycred", "example.com", "GET", "/chat", Instant::now());
+        assert_eq!(rec.cred, Some("mycred"));
+        assert_eq!(rec.host, "example.com");
+        assert_eq!(rec.method, "GET");
+        assert_eq!(rec.path, "/chat");
+        assert_eq!(rec.status, StatusCode::SWITCHING_PROTOCOLS.as_u16());
+        assert_eq!(rec.bytes_in, 0);
+        assert_eq!(rec.bytes_out, 0);
+        assert_eq!(rec.decision, "allow");
+        assert_eq!(rec.reason, Some("upgrade did not complete after 101"));
+        assert_eq!(rec.protocol, Some("websocket"));
     }
 }

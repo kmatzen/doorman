@@ -287,7 +287,7 @@ One JSON line per request, fsync'd. Default path `/var/log/doorman/audit.log`, m
 | `bytes_out` | response body bytes returned |
 | `ms` | total latency, accept to last byte |
 | `decision` | `"allow"` or `"deny"` |
-| `reason` | denial reason (denies only) |
+| `reason` | denial reason on a deny; on an `"allow"` it's normally omitted, except for the one case where doorman already answered 101 to a WebSocket upgrade but the connection failed to complete before any bytes were spliced — there it explains why `bytes_in`/`bytes_out` are 0 despite the credential having reached the upstream |
 | `protocol` | `"websocket"` for a spliced Upgrade relay; omitted for normal request/response |
 
 No bodies, no headers, no secrets.
