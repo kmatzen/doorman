@@ -121,24 +121,58 @@ fn print_launchd_plist(bin: &str) {
     print!("{}", LAUNCHD_TEMPLATE.replace("__BIN_PATH__", bin));
 }
 
+/// Parse a `fingerprint` CLI target into `(host, port)`. Bracketed IPv6
+/// (`[fd00::5]` or `[fd00::5]:8443`) is required for IPv6 literals — bare
+/// IPv6 is inherently ambiguous with the `:port` suffix, since the literal's
+/// own colons collide with the separator. Everything else (hostnames, IPv4
+/// literals) works as a bare `host` or `host:port`, matching the pre-IPv6
+/// behavior exactly. Default port is 443.
+fn parse_fingerprint_target(target: &str) -> Result<(String, u16), String> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("{:?}: missing closing ']' for IPv6 literal", target))?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p
+                .parse::<u16>()
+                .map_err(|e| format!("invalid port {:?}: {}", p, e))?,
+            None if after.is_empty() => 443,
+            None => {
+                return Err(format!(
+                    "{:?}: unexpected characters after ']': {:?}",
+                    target, after
+                ))
+            }
+        };
+        return Ok((host.to_string(), port));
+    }
+    Ok(match target.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|e| format!("invalid port {:?}: {}", p, e))?,
+        ),
+        None => (target.to_string(), 443),
+    })
+}
+
 /// `doormand fingerprint <host[:port]>` — open a TLS connection to the
 /// upstream accepting any certificate, print `sha256:<hex>` for the leaf,
 /// and exit. Output is meant to be pasted straight into a credential
 /// entry's `tls_pinned_sha256` field. No audit log, no config — this is
 /// an out-of-band helper for the bootstrap step where the operator decides
 /// what to pin.
+///
+/// An IPv6 target must use bracket notation (`[fd00::5]` or
+/// `[fd00::5]:8443`) — bare IPv6 is ambiguous with the `:port` suffix (a
+/// literal's own colons collide with the separator), the same reason URIs
+/// require brackets there. Everything else (hostnames, IPv4 literals)
+/// works as a bare `host` or `host:port`, as before.
 fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
     let target = args.first().ok_or("fingerprint: missing <host[:port]>")?;
     if args.len() > 1 {
         return Err(format!("fingerprint: unexpected extra arg {:?}", args[1]));
     }
-    let (host, port) = match target.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse::<u16>().map_err(|e| format!("invalid port {:?}: {}", p, e))?,
-        ),
-        None => (target.clone(), 443),
-    };
+    let (host, port) = parse_fingerprint_target(target)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -200,10 +234,13 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
             .with_custom_certificate_verifier(Arc::clone(&verifier) as _)
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(cfg));
-        let addr = format!("{}:{}", host, port);
-        let tcp = TcpStream::connect(&addr)
+        // (host, port) tuple form, not a formatted "host:port" string: for a
+        // bare IPv6 literal, string concatenation would be ambiguous colon
+        // soup. Rust's resolver accepts an unbracketed IPv4/IPv6/hostname
+        // string as the host half of this tuple directly.
+        let tcp = TcpStream::connect((host.as_str(), port))
             .await
-            .map_err(|e| format!("dial {}: {}", addr, e))?;
+            .map_err(|e| format!("dial {}:{}: {}", host, port, e))?;
         let server_name: ServerName<'static> = ServerName::try_from(host.clone())
             .map_err(|e| format!("server name {:?}: {}", host, e))?;
         // We don't need to send anything — just complete the handshake so the
@@ -383,4 +420,59 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             _ = sighup => { Ok(()) }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_target_bare_host_no_port() {
+        assert_eq!(
+            parse_fingerprint_target("api.github.com").unwrap(),
+            ("api.github.com".to_string(), 443)
+        );
+    }
+
+    #[test]
+    fn fingerprint_target_bare_host_with_port() {
+        assert_eq!(
+            parse_fingerprint_target("192.168.86.1:8443").unwrap(),
+            ("192.168.86.1".to_string(), 8443)
+        );
+    }
+
+    #[test]
+    fn fingerprint_target_bracketed_ipv6_no_port() {
+        assert_eq!(
+            parse_fingerprint_target("[fd00::5]").unwrap(),
+            ("fd00::5".to_string(), 443)
+        );
+    }
+
+    #[test]
+    fn fingerprint_target_bracketed_ipv6_with_port() {
+        assert_eq!(
+            parse_fingerprint_target("[fd00::5]:8443").unwrap(),
+            ("fd00::5".to_string(), 8443)
+        );
+    }
+
+    #[test]
+    fn fingerprint_target_rejects_unclosed_bracket() {
+        let err = parse_fingerprint_target("[fd00::5").unwrap_err();
+        assert!(err.contains("closing"), "got: {}", err);
+    }
+
+    #[test]
+    fn fingerprint_target_rejects_garbage_after_bracket() {
+        let err = parse_fingerprint_target("[fd00::5]garbage").unwrap_err();
+        assert!(err.contains("unexpected characters"), "got: {}", err);
+    }
+
+    #[test]
+    fn fingerprint_target_rejects_bad_port() {
+        assert!(parse_fingerprint_target("host:notaport").is_err());
+        assert!(parse_fingerprint_target("[fd00::5]:notaport").is_err());
+    }
 }

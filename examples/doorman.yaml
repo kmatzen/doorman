@@ -38,3 +38,14 @@
   inject: "X-API-Key: {}"
   hosts: [192.168.86.1]
   tls_pinned_sha256: REPLACE_WITH_64_HEX_CHARS_FROM_FINGERPRINT
+
+# IPv6-only LAN device: hosts are bare, same as any other entry -- no
+# brackets (those are wire syntax the agent uses, e.g. `http://[fd00::5]:8123/`,
+# not config syntax). For `fingerprint` with an IPv6 target, brackets ARE
+# required there (ambiguous with the :port suffix otherwise):
+#   doormand fingerprint '[fd00::5]:8443'
+- name: bazarr_v6
+  secret: bazarr_api_key_replace_me
+  inject: "X-API-KEY: {}"
+  hosts: [fd00::5]
+  port: 8443
