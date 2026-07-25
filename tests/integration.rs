@@ -489,6 +489,48 @@ async fn deny_multiple_cred_headers() {
 }
 
 #[tokio::test]
+async fn upstream_dial_failure_produces_valid_json_error_body() {
+    // No listener on this port: send_upstream's dial fails and its OS error
+    // text (which can contain arbitrary characters, e.g. quotes on some
+    // platforms/paths) is interpolated into the deny reason. The body must
+    // still be valid JSON, not hand-formatted with unescaped interpolation.
+    let unused_port = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let proxy = spawn_doorman(
+        vec![entry(
+            "test",
+            "SECRET",
+            "Authorization",
+            &["localhost"],
+            &[],
+            unused_port,
+        )],
+        rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth()
+            .into(),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/x",
+        vec![("X-Doorman-Cred", "test")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body not valid JSON: {} ({:?})", e, body));
+    assert!(parsed["error"].as_str().unwrap().contains("upstream"));
+}
+
+#[tokio::test]
 async fn response_strips_set_cookie_and_www_authenticate() {
     let ca = TestCa::generate();
     let (upstream_addr, _) = spawn_mock_upstream(ca.server_config_for("localhost")).await;

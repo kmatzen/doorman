@@ -320,7 +320,7 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
                 &path_and_query,
                 Some(&cred_name),
                 StatusCode::BAD_GATEWAY,
-                Some(format!("upstream: {}", e).leak()),
+                Some(&format!("upstream: {}", e)),
                 started,
             );
         }
@@ -379,7 +379,7 @@ async fn relay_upgrade(
                 &path,
                 Some(&cred_name),
                 StatusCode::BAD_GATEWAY,
-                Some(format!("upstream: {}", e).leak()),
+                Some(&format!("upstream: {}", e)),
                 started,
             );
         }
@@ -627,13 +627,10 @@ fn deny(
     path: &str,
     cred: Option<&str>,
     status: StatusCode,
-    reason: Option<&'static str>,
+    reason: Option<&str>,
     started: Instant,
 ) -> Response<ProxyBody> {
-    let body = match reason {
-        Some(r) => format!("{{\"error\":\"{}\"}}\n", r),
-        None => "{\"error\":\"denied\"}\n".to_string(),
-    };
+    let body = serde_json::json!({ "error": reason.unwrap_or("denied") }).to_string() + "\n";
     let body_bytes = Bytes::from(body);
     let bytes_out = body_bytes.len() as u64;
 
