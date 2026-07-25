@@ -149,7 +149,8 @@ fn parse_fingerprint_target(target: &str) -> Result<(String, u16), String> {
     Ok(match target.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
-            p.parse::<u16>().map_err(|e| format!("invalid port {:?}: {}", p, e))?,
+            p.parse::<u16>()
+                .map_err(|e| format!("invalid port {:?}: {}", p, e))?,
         ),
         None => (target.to_string(), 443),
     })
@@ -179,10 +180,12 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
     runtime.block_on(async move {
-        use std::sync::Arc;
-        use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
         use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
         use rustls::{DigitallySignedStruct, SignatureScheme};
+        use std::sync::Arc;
         use tokio::net::TcpStream;
         use tokio_rustls::TlsConnector;
 
@@ -387,7 +390,10 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
                 eprintln!("doormand: audit config_load write failed: {}", e);
             }
         }
-        Err(e) => eprintln!("doormand: could not re-read config for audit fingerprint: {}", e),
+        Err(e) => eprintln!(
+            "doormand: could not re-read config for audit fingerprint: {}",
+            e
+        ),
     }
 
     let server = proxy::Server {

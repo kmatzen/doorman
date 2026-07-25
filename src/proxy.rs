@@ -45,9 +45,9 @@ use std::time::Instant;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
+use hyper::client::conn::http1 as client_http1;
 use hyper::header::{HeaderName, HeaderValue, CONNECTION, HOST, UPGRADE};
 use hyper::server::conn::http1 as server_http1;
-use hyper::client::conn::http1 as client_http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -267,8 +267,7 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
     strip_hop_by_hop(&mut parts.headers, is_upgrade);
     let inject_name =
         HeaderName::try_from(entry.header_name.as_str()).expect("validated at config load");
-    let inject_value =
-        HeaderValue::try_from(entry.render()).expect("validated at config load");
+    let inject_value = HeaderValue::try_from(entry.render()).expect("validated at config load");
     parts.headers.insert(inject_name, inject_value);
     parts.headers.insert(
         HOST,
@@ -506,7 +505,8 @@ async fn relay_upgrade(
         let mut upstream_io = TokioIo::new(upstream_io);
         // copy_bidirectional returns (a->b, b->a): (agent->upstream uploaded,
         // upstream->agent returned), matching bytes_in / bytes_out elsewhere.
-        let (bytes_in, bytes_out) = match copy_bidirectional(&mut agent_io, &mut upstream_io).await {
+        let (bytes_in, bytes_out) = match copy_bidirectional(&mut agent_io, &mut upstream_io).await
+        {
             Ok(counts) => counts,
             Err(e) => {
                 eprintln!("websocket relay ended with error: {}", e);
@@ -620,7 +620,9 @@ fn finish_response(
 /// An empty `ProxyBody`, used for the 101 response we hand back on a successful
 /// WebSocket upgrade (the bytes after the handshake are spliced, not bodied).
 fn empty_body() -> ProxyBody {
-    Empty::<Bytes>::new().map_err(|e: Infallible| match e {}).boxed()
+    Empty::<Bytes>::new()
+        .map_err(|e: Infallible| match e {})
+        .boxed()
 }
 
 /// Pull the upstream host out of an absolute-form URI authority, or fall
@@ -931,7 +933,9 @@ impl ServerCertVerifier for PinVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        default_provider().signature_verification_algorithms.supported_schemes()
+        default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -1078,7 +1082,11 @@ mod tests {
         assert_eq!(strip_v6_brackets("[fd00::5]"), "fd00::5");
         assert_eq!(strip_v6_brackets("fd00::5"), "fd00::5");
         assert_eq!(strip_v6_brackets("example.com"), "example.com");
-        assert_eq!(strip_v6_brackets("[fd00::5"), "[fd00::5", "unclosed bracket left alone");
+        assert_eq!(
+            strip_v6_brackets("[fd00::5"),
+            "[fd00::5",
+            "unclosed bracket left alone"
+        );
     }
 
     #[test]
