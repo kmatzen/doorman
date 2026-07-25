@@ -91,7 +91,8 @@ impl Audit {
         let mut buf = serde_json::to_vec(value).map_err(|e| format!("serialize audit: {}", e))?;
         buf.push(b'\n');
         let mut f = self.file.lock().unwrap();
-        f.write_all(&buf).map_err(|e| format!("write audit: {}", e))?;
+        f.write_all(&buf)
+            .map_err(|e| format!("write audit: {}", e))?;
         f.sync_data().map_err(|e| format!("fsync audit: {}", e))?;
         Ok(())
     }
@@ -203,8 +204,16 @@ mod tests {
             .unwrap();
         let line = std::fs::read_to_string(&p).unwrap();
         assert!(line.contains("\"event\":\"config_load\""), "got: {}", line);
-        assert!(line.contains("\"config_sha256\":\"abc123\""), "got: {}", line);
-        assert!(line.contains("github") && line.contains("stripe"), "got: {}", line);
+        assert!(
+            line.contains("\"config_sha256\":\"abc123\""),
+            "got: {}",
+            line
+        );
+        assert!(
+            line.contains("github") && line.contains("stripe"),
+            "got: {}",
+            line
+        );
         std::fs::remove_file(&p).ok();
     }
 }

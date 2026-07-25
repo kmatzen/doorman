@@ -25,6 +25,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
       - name: Build
         run: cargo build --all-targets --locked
       - name: Test

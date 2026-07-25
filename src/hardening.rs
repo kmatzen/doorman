@@ -153,7 +153,10 @@ mod tests {
         // reliable everywhere.
         disable_ptrace_and_core_dumps().expect("prctl(PR_SET_DUMPABLE, 0) should not fail");
         let after = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
-        assert_eq!(after, 0, "expected non-dumpable after disable_ptrace_and_core_dumps");
+        assert_eq!(
+            after, 0,
+            "expected non-dumpable after disable_ptrace_and_core_dumps"
+        );
         // Restore dumpable so other tests in this process (run concurrently
         // in the same binary) aren't affected by this one's side effect.
         unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
