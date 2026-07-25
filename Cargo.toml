@@ -28,7 +28,13 @@ webpki-roots = "0.26"
 # directly.
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+# serde_yaml itself was archived by its maintainer in 2024 (RUSTSEC-2024-0320)
+# and its own unsafe-libyaml dependency is unmaintained too (RUSTSEC-2024-0321).
+# serde_norway is an actively maintained fork with the same API that also
+# forked unsafe-libyaml (as unsafe-libyaml-norway), closing both advisories
+# instead of just the first — aliased to the original crate name so the rest
+# of the codebase is unchanged.
+serde_yaml = { package = "serde_norway", version = "0.9" }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 libc = "0.2"
