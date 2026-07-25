@@ -359,6 +359,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_yaml_with_a_useful_location() {
+        // An unclosed flow sequence — a genuine YAML syntax error, as
+        // opposed to the semantic-validation errors the other rejects_*
+        // tests exercise. Regression coverage for swapping the YAML backend
+        // (serde_yaml -> serde_norway, see #47): the parser must still
+        // surface a message pointing at where the problem is.
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com\n");
+        let err = load(&p, false).unwrap_err();
+        assert!(err.starts_with("parse:"), "got: {}", err);
+        assert!(err.contains("line") && err.contains("column"), "got: {}", err);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn rejects_duplicate_names() {
         let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n- name: a\n  secret: y\n  inject: 'X: {}'\n  hosts: [b.com]\n");
         assert!(load(&p, false).unwrap_err().contains("duplicate"));
