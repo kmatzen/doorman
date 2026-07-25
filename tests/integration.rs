@@ -513,6 +513,67 @@ async fn deny_missing_cred_header() {
 }
 
 #[tokio::test]
+async fn deny_connect_even_with_valid_credential() {
+    // CONNECT is the classic HTTPS_PROXY / wss:// misconfiguration. Doorman
+    // never tunnels, so this must be rejected deterministically — even when
+    // the request carries a credential valid for an allowlisted host, which
+    // would otherwise fall through to send_upstream and forward a method
+    // doorman was never built to relay.
+    let ca = TestCa::generate();
+    let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
+    let proxy = spawn_doorman(
+        vec![entry(
+            "test",
+            "SECRET",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        proxy,
+        Method::CONNECT,
+        "localhost",
+        "/",
+        vec![("X-Doorman-Cred", "test")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(std::str::from_utf8(&body).unwrap().contains("CONNECT is not supported"));
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "upstream must not be contacted for a CONNECT request"
+    );
+}
+
+#[tokio::test]
+async fn deny_connect_without_credential() {
+    let ca = TestCa::generate();
+    let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
+    let proxy = spawn_doorman(
+        vec![entry(
+            "test",
+            "SECRET",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, _, body) = request(proxy, Method::CONNECT, "localhost", "/", vec![]).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(std::str::from_utf8(&body).unwrap().contains("CONNECT is not supported"));
+    assert!(captured.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn deny_multiple_cred_headers() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
