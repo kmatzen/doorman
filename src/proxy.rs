@@ -157,6 +157,19 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
     let started = Instant::now();
     let method = req.method().clone();
 
+    // CONNECT is the classic HTTPS_PROXY / wss:// misconfiguration: doorman
+    // is a strict forward proxy that reads http:// requests and
+    // re-originates TLS itself (see the "what this module deliberately does
+    // NOT do" note above) — it was never going to tunnel one. Reject it here,
+    // before any other processing: left to fall through, a CONNECT with no
+    // cred header dies with a generic "missing X-Doorman-Cred" that doesn't
+    // name the actual problem, and a CONNECT that happens to carry a valid
+    // cred header for an allowlisted host would reach `send_upstream` and
+    // forward a method doorman was never built to relay.
+    if method == hyper::Method::CONNECT {
+        return deny_connect_not_supported(&server, &req, started);
+    }
+
     // Resolve target host: prefer the URI authority (absolute-form requests
     // sent to a forward proxy) and fall back to the `Host` header.
     let target_host = match resolve_target_host(&req) {
@@ -715,6 +728,30 @@ fn deny_no_target(
         None,
         StatusCode::BAD_REQUEST,
         Some("no target host (need absolute-form URI or Host header)"),
+        started,
+    )
+}
+
+/// Special-case deny for a CONNECT request. Doorman never tunnels, so this is
+/// always a deterministic 405 naming the fix rather than whatever confusing
+/// status the request would otherwise bottom out at.
+fn deny_connect_not_supported(
+    server: &Server,
+    req: &Request<Incoming>,
+    started: Instant,
+) -> Response<ProxyBody> {
+    let target_host = resolve_target_host(req).unwrap_or_else(|| "<unknown>".to_string());
+    deny(
+        server,
+        &target_host,
+        "CONNECT",
+        &req.uri().to_string(),
+        None,
+        StatusCode::METHOD_NOT_ALLOWED,
+        Some(
+            "CONNECT is not supported; unset HTTPS_PROXY and use http:// URLs via \
+             HTTP_PROXY (doorman re-originates TLS upstream)",
+        ),
         started,
     )
 }

@@ -175,6 +175,7 @@ curl --proxy http://127.0.0.1:18443 \
 - Exactly one `X-Doorman-Cred` header per request. Zero, empty, or multiple → 403.
 - Credential names must match config entries exactly (case-sensitive).
 - Doorman overwrites the `Authorization` header (or whatever the `inject` template targets); the agent can't influence it.
+- **Getting a `405 CONNECT is not supported`?** Something is set to `HTTPS_PROXY` instead of `HTTP_PROXY`, or the code is requesting an `https://`/`wss://` URL. That makes the client tunnel via `CONNECT`, which doorman — a strict `http://` forward proxy that re-originates TLS itself — never accepts. Unset `HTTPS_PROXY` and use `http://` URLs through `HTTP_PROXY`.
 
 ### WebSocket upgrades
 
