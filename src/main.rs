@@ -149,7 +149,8 @@ fn parse_fingerprint_target(target: &str) -> Result<(String, u16), String> {
     Ok(match target.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
-            p.parse::<u16>().map_err(|e| format!("invalid port {:?}: {}", p, e))?,
+            p.parse::<u16>()
+                .map_err(|e| format!("invalid port {:?}: {}", p, e))?,
         ),
         None => (target.to_string(), 443),
     })

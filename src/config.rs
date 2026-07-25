@@ -412,7 +412,11 @@ mod tests {
         let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com\n");
         let err = load(&p, false).unwrap_err();
         assert!(err.starts_with("parse:"), "got: {}", err);
-        assert!(err.contains("line") && err.contains("column"), "got: {}", err);
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "got: {}",
+            err
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -460,12 +464,20 @@ mod tests {
         // ::1 and 0:0:0:0:0:0:0:1 are the same address; both the config
         // value and a runtime lookup must normalize to the same string so
         // an operator's chosen spelling doesn't accidentally fail to match.
-        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['0:0:0:0:0:0:0:1']\n");
+        let p =
+            write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['0:0:0:0:0:0:0:1']\n");
         let cfg = load(&p, false).unwrap();
         let e = &cfg.entries[0];
-        assert_eq!(e.hosts, vec!["::1".to_string()], "should store RFC 5952 canonical form");
+        assert_eq!(
+            e.hosts,
+            vec!["::1".to_string()],
+            "should store RFC 5952 canonical form"
+        );
         assert!(e.host_allowed("::1"));
-        assert!(e.host_allowed("0:0:0:0:0:0:0:1"), "differently-formatted equivalent must still match");
+        assert!(
+            e.host_allowed("0:0:0:0:0:0:0:1"),
+            "differently-formatted equivalent must still match"
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -485,7 +497,9 @@ mod tests {
         // `api.example.com:443` isn't a valid IPv6 literal (or a hostname
         // doorman accepts a port suffix on) — config hosts never carry a
         // port, that's the separate `port:` field.
-        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['api.example.com:443']\n");
+        let p = write_tmp(
+            "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['api.example.com:443']\n",
+        );
         let err = load(&p, false).unwrap_err();
         assert!(err.contains("bare hostname"), "got: {}", err);
         std::fs::remove_file(&p).ok();
@@ -522,7 +536,9 @@ mod tests {
 
     #[test]
     fn rejects_connect_method() {
-        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [CONNECT]\n");
+        let p = write_tmp(
+            "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [CONNECT]\n",
+        );
         let err = load(&p, false).unwrap_err();
         assert!(err.contains("invalid HTTP method"), "got: {}", err);
         std::fs::remove_file(&p).ok();
@@ -530,7 +546,9 @@ mod tests {
 
     #[test]
     fn rejects_garbage_method() {
-        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [\"GE T\"]\n");
+        let p = write_tmp(
+            "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [\"GE T\"]\n",
+        );
         let err = load(&p, false).unwrap_err();
         assert!(err.contains("invalid HTTP method"), "got: {}", err);
         std::fs::remove_file(&p).ok();

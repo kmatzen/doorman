@@ -358,12 +358,18 @@ async fn connection_header_and_its_nominated_headers_are_stripped_from_requests(
     assert_eq!(status, StatusCode::OK);
 
     let req = captured.lock().unwrap().last().cloned().unwrap();
-    assert!(!req.headers.contains_key("connection"), "Connection must be stripped");
+    assert!(
+        !req.headers.contains_key("connection"),
+        "Connection must be stripped"
+    );
     assert!(
         !req.headers.contains_key("x-custom"),
         "a header only named via Connection must still be stripped"
     );
-    assert!(!req.headers.contains_key("keep-alive"), "Keep-Alive must be stripped");
+    assert!(
+        !req.headers.contains_key("keep-alive"),
+        "Keep-Alive must be stripped"
+    );
     // The credential header injection itself is unaffected by this.
     assert_eq!(
         req.headers.get("authorization").map(String::as_str),
@@ -564,7 +570,9 @@ async fn deny_connect_even_with_valid_credential() {
     )
     .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert!(std::str::from_utf8(&body).unwrap().contains("CONNECT is not supported"));
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("CONNECT is not supported"));
     assert!(
         captured.lock().unwrap().is_empty(),
         "upstream must not be contacted for a CONNECT request"
@@ -590,7 +598,9 @@ async fn deny_connect_without_credential() {
 
     let (status, _, body) = request(proxy, Method::CONNECT, "localhost", "/", vec![]).await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert!(std::str::from_utf8(&body).unwrap().contains("CONNECT is not supported"));
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("CONNECT is not supported"));
     assert!(captured.lock().unwrap().is_empty());
 }
 
@@ -661,8 +671,8 @@ async fn upstream_dial_failure_produces_valid_json_error_body() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body not valid JSON: {} ({:?})", e, body));
+    let parsed: serde_json::Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("body not valid JSON: {} ({:?})", e, body));
     assert!(parsed["error"].as_str().unwrap().contains("upstream"));
 }
 
@@ -738,8 +748,14 @@ async fn response_strips_hop_by_hop_headers() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(&body[..], b"upstream-ok", "body still relayed correctly");
-    assert!(headers.get("connection").is_none(), "Connection should be stripped");
-    assert!(headers.get("keep-alive").is_none(), "Keep-Alive should be stripped");
+    assert!(
+        headers.get("connection").is_none(),
+        "Connection should be stripped"
+    );
+    assert!(
+        headers.get("keep-alive").is_none(),
+        "Keep-Alive should be stripped"
+    );
     assert_eq!(
         headers.get("x-canary").map(|v| v.to_str().unwrap()),
         Some("untouched"),

@@ -1044,7 +1044,11 @@ mod tests {
         assert_eq!(strip_v6_brackets("[fd00::5]"), "fd00::5");
         assert_eq!(strip_v6_brackets("fd00::5"), "fd00::5");
         assert_eq!(strip_v6_brackets("example.com"), "example.com");
-        assert_eq!(strip_v6_brackets("[fd00::5"), "[fd00::5", "unclosed bracket left alone");
+        assert_eq!(
+            strip_v6_brackets("[fd00::5"),
+            "[fd00::5",
+            "unclosed bracket left alone"
+        );
     }
 
     #[test]
