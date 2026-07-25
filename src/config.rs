@@ -5,10 +5,24 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::net::Ipv6Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde::Deserialize;
+
+/// Normalize a host for the allowlist and for allowlist matching. A bare
+/// (unbracketed) IPv6 literal is reparsed and reformatted through
+/// [`Ipv6Addr`], which produces the RFC 5952 canonical compressed form —
+/// this way `::1`, `0:0:0:0:0:0:0:1`, and `0:0::1` all normalize to the same
+/// string and compare equal. Anything else (hostnames, IPv4 literals) is
+/// just lowercased, as before.
+pub fn canonicalize_host(host: &str) -> String {
+    match host.parse::<Ipv6Addr>() {
+        Ok(v6) => v6.to_string(),
+        Err(_) => host.to_ascii_lowercase(),
+    }
+}
 
 /// One credential the daemon holds in memory and may inject into outgoing
 /// requests. The fields mirror the YAML one-to-one; everything else (parsed
@@ -23,7 +37,10 @@ pub struct Entry {
     pub header_prefix: String,
     /// Text after the `{}` slot in the inject template.
     pub header_suffix: String,
-    /// Lower-cased host allowlist.
+    /// Canonicalized host allowlist (see [`canonicalize_host`]): lowercased
+    /// hostnames/IPv4 literals, or RFC 5952 canonical form for bare IPv6
+    /// literals (no brackets — those are only used on the wire, e.g. in the
+    /// `Host` header, never in config or in the values this list holds).
     pub hosts: Vec<String>,
     /// Upper-cased method allowlist; empty means "any method".
     pub methods: Vec<String>,
@@ -54,8 +71,7 @@ impl Entry {
     }
 
     pub fn host_allowed(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        self.hosts.contains(&host)
+        self.hosts.contains(&canonicalize_host(host))
     }
 
     pub fn method_allowed(&self, method: &str) -> bool {
@@ -162,16 +178,29 @@ fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
     if r.hosts.is_empty() {
         return Err(format!("{} {:?}: hosts list is empty", where_(), r.name));
     }
-    let hosts: Vec<String> = r.hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
-    for h in &hosts {
-        if h.contains('/') || h.contains(':') || h.is_empty() {
-            return Err(format!(
-                "{} {:?}: host {:?} must be a bare hostname (no scheme, no port, no path)",
+    let mut hosts = Vec::with_capacity(r.hosts.len());
+    for h in &r.hosts {
+        let invalid = || {
+            format!(
+                "{} {:?}: host {:?} must be a bare hostname, IPv4 literal, or bare IPv6 literal \
+                 (no brackets, no scheme, no port, no path)",
                 where_(),
                 r.name,
                 h
-            ));
+            )
+        };
+        if h.is_empty() || h.contains('/') {
+            return Err(invalid());
         }
+        // A colon only belongs here as part of a bare IPv6 literal (e.g.
+        // `fd00::5`, no brackets, no port suffix — those are added on the
+        // wire, never in config). Anything else containing one (a port
+        // suffix, a scheme, bracket syntax) is rejected; hostnames and IPv4
+        // literals never contain a colon.
+        if h.contains(':') && h.parse::<Ipv6Addr>().is_err() {
+            return Err(invalid());
+        }
+        hosts.push(canonicalize_host(h));
     }
 
     let methods: Vec<String> = r
@@ -354,6 +383,52 @@ mod tests {
     fn rejects_host_with_scheme() {
         let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['https://a.com']\n");
         assert!(load(&p, false).unwrap_err().contains("bare hostname"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn accepts_bare_ipv6_literal_host() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['fd00::5']\n");
+        let cfg = load(&p, false).unwrap();
+        let e = &cfg.entries[0];
+        assert_eq!(e.hosts, vec!["fd00::5".to_string()]);
+        assert!(e.host_allowed("fd00::5"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn ipv6_host_canonicalizes_equivalent_representations() {
+        // ::1 and 0:0:0:0:0:0:0:1 are the same address; both the config
+        // value and a runtime lookup must normalize to the same string so
+        // an operator's chosen spelling doesn't accidentally fail to match.
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['0:0:0:0:0:0:0:1']\n");
+        let cfg = load(&p, false).unwrap();
+        let e = &cfg.entries[0];
+        assert_eq!(e.hosts, vec!["::1".to_string()], "should store RFC 5952 canonical form");
+        assert!(e.host_allowed("::1"));
+        assert!(e.host_allowed("0:0:0:0:0:0:0:1"), "differently-formatted equivalent must still match");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_bracketed_ipv6_host_in_config() {
+        // Brackets are wire syntax (URI authority, Host header); config
+        // hosts are bare, matching how a plain hostname is written.
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['[fd00::5]']\n");
+        let err = load(&p, false).unwrap_err();
+        assert!(err.contains("bare hostname"), "got: {}", err);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_hostname_with_explicit_port_in_config() {
+        // A colon is only ever valid here as part of a bare IPv6 literal.
+        // `api.example.com:443` isn't a valid IPv6 literal (or a hostname
+        // doorman accepts a port suffix on) — config hosts never carry a
+        // port, that's the separate `port:` field.
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: ['api.example.com:443']\n");
+        let err = load(&p, false).unwrap_err();
+        assert!(err.contains("bare hostname"), "got: {}", err);
         std::fs::remove_file(&p).ok();
     }
 
