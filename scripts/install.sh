@@ -67,13 +67,25 @@ if command -v gh >/dev/null 2>&1; then
   if gh attestation verify "$tarball" --repo "$REPO"; then
     log "attestation verified."
   else
-    if [ "${DOORMAN_REQUIRE_ATTESTATION:-}" = "1" ]; then
-      err "DOORMAN_REQUIRE_ATTESTATION=1 is set; refusing to install"
+    log "warning: gh attestation verify failed for the tarball (see error above)."
+    # The tarball's own attestation failed, but SHA256SUMS (which we already
+    # checksum-matched the tarball against, above) has its own separate
+    # attestation from the release workflow. If *that* verifies, the tarball's
+    # provenance is established transitively — the checksum ties it to a
+    # manifest whose signature we did check. Only fall back to an honestly
+    # unverified posture if that also fails.
+    if gh attestation verify SHA256SUMS --repo "$REPO" >/dev/null 2>&1; then
+      log "         SHA256SUMS attestation verified instead — since the tarball's"
+      log "         checksum matched that (now-verified) manifest above, its"
+      log "         provenance is established transitively."
+    else
+      if [ "${DOORMAN_REQUIRE_ATTESTATION:-}" = "1" ]; then
+        err "DOORMAN_REQUIRE_ATTESTATION=1 is set; neither the tarball nor SHA256SUMS attestation verified; refusing to install"
+      fi
+      log "         SHA256SUMS attestation verification failed too. Proceeding on a bare"
+      log "         checksum match — NEITHER file's provenance was verified in this run."
+      log "         Set DOORMAN_REQUIRE_ATTESTATION=1 to make this a hard error."
     fi
-    log "warning: gh attestation verify failed (see error above)."
-    log "         proceeding with SHA256-only verification — the SHA256SUMS file"
-    log "         is itself signed and was checked above. Set"
-    log "         DOORMAN_REQUIRE_ATTESTATION=1 to make this a hard error."
     log "         (common cause: gh < 2.49 lacks the 'attestation' subcommand.)"
   fi
 else

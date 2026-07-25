@@ -64,7 +64,7 @@ To override the version or install dir, place the env var on the **right** side 
 curl -fsSL https://github.com/kmatzen/doorman/releases/latest/download/install.sh | DOORMAN_PREFIX=$HOME/.local/bin sh
 ```
 
-`DOORMAN_VERSION` defaults to the latest release tag; `DOORMAN_PREFIX` defaults to `/usr/local/bin`.
+`DOORMAN_VERSION` defaults to the latest release tag; `DOORMAN_PREFIX` defaults to `/usr/local/bin`. `DOORMAN_REQUIRE_ATTESTATION=1` makes the installer refuse to proceed unless it can verify sigstore provenance (tarball or `SHA256SUMS`) via `gh attestation verify`, instead of falling back to a bare checksum match — worth setting in CI/image builds where you want a hard failure rather than a warning.
 
 ### From a release tarball
 
