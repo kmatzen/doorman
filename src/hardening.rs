@@ -86,6 +86,35 @@ pub fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Clear the process's dumpable bit on Linux (`PR_SET_DUMPABLE, 0`). This is
+/// the actual mechanism behind the "no core dumps, no ptrace from same-uid
+/// processes" claim in the threat model: without it, a normally started
+/// process defaults to dumpable, so any same-uid process can `ptrace` it (or
+/// a crash/`gcore` can dump it) and lift every decrypted secret straight out
+/// of its memory — the exact same-uid exposure the systemd unit's
+/// `NoNewPrivileges`/capability-dropping is meant to close off. `prctl` with
+/// this option cannot fail for a process operating on itself, so a non-zero
+/// return is a genuine (if theoretically unreachable) error worth surfacing
+/// rather than silently ignoring.
+///
+/// No such primitive exists on macOS (the README already notes its hardening
+/// is weaker than systemd's); this is a no-op there.
+#[cfg(target_os = "linux")]
+pub fn disable_ptrace_and_core_dumps() -> Result<(), std::io::Error> {
+    // SAFETY: PR_SET_DUMPABLE takes no pointer arguments; the trailing zeros
+    // are ignored by the kernel for this option.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn disable_ptrace_and_core_dumps() -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +142,20 @@ mod tests {
         // check exercises whichever cutoff this build uses.
         assert!(login_uid_warning(1000).is_some());
         assert!(login_uid_warning(login_uid_min() + 1).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disable_ptrace_and_core_dumps_clears_the_dumpable_bit() {
+        // Query via PR_GET_DUMPABLE rather than /proc/self/status: some
+        // sandboxed/containerized kernels (e.g. gVisor) don't populate the
+        // `Dumpable:` line in their /proc emulation, but prctl itself is
+        // reliable everywhere.
+        disable_ptrace_and_core_dumps().expect("prctl(PR_SET_DUMPABLE, 0) should not fail");
+        let after = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        assert_eq!(after, 0, "expected non-dumpable after disable_ptrace_and_core_dumps");
+        // Restore dumpable so other tests in this process (run concurrently
+        // in the same binary) aren't affected by this one's side effect.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
     }
 }
