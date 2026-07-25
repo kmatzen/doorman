@@ -181,6 +181,7 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
     } else {
         None
     };
+    let is_upgrade = agent_upgrade.is_some();
 
     let (mut parts, body) = req.into_parts();
 
@@ -243,19 +244,14 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
 
     // Rewrite headers (shared by the normal and the WebSocket-upgrade paths):
     // drop the cred-name header (a doorman-internal signal that must not leak
-    // upstream), drop the proxy-hop and length-shaped headers, inject the
-    // templated auth header, and set Host to the canonical target. We leave
-    // `Connection`, `Upgrade` and any `Sec-WebSocket-*` headers untouched so an
-    // upgrade handshake reaches the upstream intact.
+    // upstream), drop hop-by-hop headers, inject the templated auth header,
+    // and set Host to the canonical target. For an upgrade request,
+    // `Connection: upgrade` and `Upgrade` are left in place (doorman
+    // deliberately re-establishes the handshake with the upstream rather
+    // than tunneling) along with any `Sec-WebSocket-*` headers, which are
+    // end-to-end, not hop-by-hop, and were never touched here.
     parts.headers.remove(CRED_HEADER);
-    for h in [
-        "proxy-connection",
-        "proxy-authorization",
-        "transfer-encoding",
-        "content-length",
-    ] {
-        parts.headers.remove(h);
-    }
+    strip_hop_by_hop(&mut parts.headers, is_upgrade);
     let inject_name =
         HeaderName::try_from(entry.header_name.as_str()).expect("validated at config load");
     let inject_value =
@@ -350,6 +346,65 @@ fn is_upgrade_request(headers: &hyper::HeaderMap) -> bool {
     connection_lists_upgrade && headers.contains_key(UPGRADE)
 }
 
+/// Headers that never cross a connection boundary regardless of what's being
+/// relayed — RFC 9110 §7.6.1's connection-specific fields (minus `Connection`
+/// and `Upgrade` themselves, handled separately below) plus the two
+/// proxy-specific headers a forward proxy must never forward, plus
+/// `content-length`/`transfer-encoding` (hyper recomputes body framing from
+/// what it's given; copying either verbatim across a re-framed body is wrong).
+const ALWAYS_STRIPPED_HOP_HEADERS: &[&str] = &[
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "content-length",
+];
+
+/// Strip hop-by-hop headers from a request or response before it crosses a
+/// connection boundary (agent -> doorman, or doorman -> upstream, and back).
+///
+/// Always removes [`ALWAYS_STRIPPED_HOP_HEADERS`], plus every header the
+/// `Connection` header itself nominates — per RFC 9110 §7.6.1 an intermediary
+/// must remove `Connection` and everything it lists before forwarding, and
+/// without this an agent could smuggle an extra header past doorman's
+/// rewrite by naming it in `Connection` instead of setting it directly.
+///
+/// For an Upgrade request/response (`is_upgrade` true), `Connection` and
+/// `Upgrade` are left in place: doorman deliberately re-establishes the
+/// handshake with the next hop rather than tunneling, so those two headers
+/// are the mechanism, not hop-by-hop noise to discard. Any *other* header
+/// nominated in `Connection` is still stripped even on an upgrade.
+/// `Sec-WebSocket-*` headers are end-to-end, not hop-by-hop, and are never
+/// touched here.
+fn strip_hop_by_hop(headers: &mut hyper::HeaderMap, is_upgrade: bool) {
+    // Collect nominated names before removing anything — removing headers
+    // first would also destroy the Connection header we're reading from.
+    let nominated: Vec<String> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|tok| tok.trim().to_ascii_lowercase())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+
+    for h in ALWAYS_STRIPPED_HOP_HEADERS {
+        headers.remove(*h);
+    }
+    if !is_upgrade {
+        headers.remove(CONNECTION);
+        headers.remove(UPGRADE);
+    }
+    for name in nominated {
+        if is_upgrade && name == "upgrade" {
+            continue; // the handshake signal itself, not hop-by-hop noise
+        }
+        headers.remove(name.as_str());
+    }
+}
+
 /// Relay a WebSocket/Upgrade handshake to the upstream. The credential has
 /// already been validated against the host/method allowlist by `serve`. We
 /// forward the (already-rewritten) request, and if the upstream answers 101 we
@@ -402,12 +457,14 @@ async fn relay_upgrade(
 
     // 101 Switching Protocols. Take the upstream-side upgrade handle and copy
     // the handshake response headers back to the agent (minus the ones we
-    // strip everywhere), then splice once both ends have upgraded.
+    // strip everywhere; `Connection`/`Upgrade` are kept since this response
+    // *is* the handshake), then splice once both ends have upgraded.
     let upstream_upgrade = hyper::upgrade::on(&mut upstream_response);
     let mut out_headers = upstream_response.headers().clone();
     for h in STRIPPED_RESPONSE_HEADERS {
         out_headers.remove(*h);
     }
+    strip_hop_by_hop(&mut out_headers, true);
 
     let audit = Arc::clone(&server.audit);
     tokio::spawn(async move {
@@ -479,6 +536,9 @@ fn finish_response(
     for h in STRIPPED_RESPONSE_HEADERS {
         out_headers.remove(*h);
     }
+    // This is always an ordinary (non-101) response, even when reached via
+    // the "upstream declined the upgrade" branch of relay_upgrade.
+    strip_hop_by_hop(&mut out_headers, false);
     let status = resp_parts.status;
 
     let bytes_out_counter = Arc::new(AtomicU64::new(0));

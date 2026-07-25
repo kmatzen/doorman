@@ -139,6 +139,8 @@ async fn spawn_mock_upstream(server_tls: Arc<rustls::ServerConfig>) -> (SocketAd
                             .status(200)
                             .header("set-cookie", "session=secret")
                             .header("www-authenticate", "Bearer realm=fake")
+                            .header("connection", "close")
+                            .header("keep-alive", "timeout=5")
                             .header("x-canary", "untouched")
                             .body(Full::new(Bytes::from_static(b"upstream-ok")))
                             .unwrap();
@@ -308,6 +310,58 @@ async fn allow_path_injects_secret_and_strips_cred_header() {
     assert_eq!(req.path, "/some/path");
     assert_eq!(req.headers.get("authorization").map(String::as_str), Some("Bearer SECRET_VALUE"));
     assert!(!req.headers.contains_key("x-doorman-cred"), "cred header must not leak");
+}
+
+#[tokio::test]
+async fn connection_header_and_its_nominated_headers_are_stripped_from_requests() {
+    // RFC 9110 §7.6.1: an intermediary must remove `Connection` and every
+    // header it nominates before forwarding. Without this, an agent could
+    // smuggle an extra header past doorman's rewrite by naming it in
+    // `Connection` instead of setting it directly, or leave stale connection
+    // management (`Connection: close`) on a request destined for a brand new
+    // upstream connection.
+    let ca = TestCa::generate();
+    let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
+    let proxy = spawn_doorman(
+        vec![entry(
+            "test",
+            "SECRET_VALUE",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, _, _) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/x",
+        vec![
+            ("X-Doorman-Cred", "test"),
+            ("Connection", "close, X-Custom"),
+            ("X-Custom", "should-not-leak"),
+            ("Keep-Alive", "timeout=5"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let req = captured.lock().unwrap().last().cloned().unwrap();
+    assert!(!req.headers.contains_key("connection"), "Connection must be stripped");
+    assert!(
+        !req.headers.contains_key("x-custom"),
+        "a header only named via Connection must still be stripped"
+    );
+    assert!(!req.headers.contains_key("keep-alive"), "Keep-Alive must be stripped");
+    // The credential header injection itself is unaffected by this.
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some("Bearer SECRET_VALUE")
+    );
 }
 
 #[tokio::test]
@@ -562,6 +616,46 @@ async fn response_strips_set_cookie_and_www_authenticate() {
         headers.get("x-canary").map(|v| v.to_str().unwrap()),
         Some("untouched"),
         "non-sensitive headers must pass through"
+    );
+}
+
+#[tokio::test]
+async fn response_strips_hop_by_hop_headers() {
+    // The mock upstream's response (spawn_mock_upstream) also carries
+    // Connection: close and Keep-Alive: timeout=5 — connection-management
+    // headers that describe doorman's connection to the *upstream*, not the
+    // agent's connection to doorman, and must not be relayed through.
+    let ca = TestCa::generate();
+    let (upstream_addr, _) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
+    let proxy = spawn_doorman(
+        vec![entry(
+            "test",
+            "SECRET",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, headers, body) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/x",
+        vec![("X-Doorman-Cred", "test")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"upstream-ok", "body still relayed correctly");
+    assert!(headers.get("connection").is_none(), "Connection should be stripped");
+    assert!(headers.get("keep-alive").is_none(), "Keep-Alive should be stripped");
+    assert_eq!(
+        headers.get("x-canary").map(|v| v.to_str().unwrap()),
+        Some("untouched"),
+        "non-hop-by-hop headers must still pass through"
     );
 }
 
