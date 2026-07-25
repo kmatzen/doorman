@@ -30,6 +30,11 @@ pub struct Record<'a> {
     pub bytes_out: u64,
     pub ms: u64,
     pub decision: &'static str,
+    /// Denial reason on a `"deny"`. On an `"allow"` this is normally omitted,
+    /// except for a WebSocket upgrade that got a 101 but then failed to
+    /// complete before any bytes were spliced — there it explains the zeroed
+    /// byte counts despite the credential having already reached the
+    /// upstream (see `relay_upgrade` in proxy.rs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'a str>,
     /// Application protocol when it isn't plain request/response — currently
