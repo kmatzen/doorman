@@ -321,8 +321,19 @@ fn is_header_name_char(c: char) -> bool {
     c.is_ascii_graphic() && !matches!(c, '(' | ')' | ',' | '/' | ':' | ';' | '<' | '=' | '>' | '?' | '@' | '[' | '\\' | ']' | '{' | '}' | '"')
 }
 
+/// Any RFC 9110 token is a legitimate HTTP method name — this used to allow
+/// only a fixed list of common verbs, which was stricter than the runtime
+/// enforcement (an *omitted* `methods:` list allows every method), so an
+/// operator could never narrow a credential to, say, WebDAV/CalDAV verbs
+/// (`PROPFIND`, `REPORT`, `MKCOL`, ...) without the config load failing.
+/// Restricting scope should never be harder than not restricting it.
+///
+/// `CONNECT` is rejected explicitly: doorman is a strict forward proxy that
+/// never tunnels (see the "what this module deliberately does NOT do" note
+/// in proxy.rs), so an allowlisted CONNECT could never do anything useful —
+/// it would just be dead configuration that looks live.
 fn is_valid_method(m: &str) -> bool {
-    matches!(m, "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS")
+    !m.is_empty() && m != "CONNECT" && m.chars().all(is_header_name_char)
 }
 
 #[cfg(test)]
@@ -454,6 +465,38 @@ mod tests {
         assert!(e.method_allowed("GET"));
         assert!(e.method_allowed("post"));
         assert!(!e.method_allowed("DELETE"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn accepts_non_standard_verbs_like_webdav_methods() {
+        // An omitted `methods:` list allows every method at runtime, so
+        // validation must not be stricter than that in the direction that
+        // prevents an operator from *narrowing* a credential's scope.
+        let p = write_tmp(
+            "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [PROPFIND, REPORT]\n",
+        );
+        let cfg = load(&p, false).unwrap();
+        let e = &cfg.entries[0];
+        assert!(e.method_allowed("PROPFIND"));
+        assert!(e.method_allowed("report"));
+        assert!(!e.method_allowed("GET"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_connect_method() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [CONNECT]\n");
+        let err = load(&p, false).unwrap_err();
+        assert!(err.contains("invalid HTTP method"), "got: {}", err);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_garbage_method() {
+        let p = write_tmp("- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n  methods: [\"GE T\"]\n");
+        let err = load(&p, false).unwrap_err();
+        assert!(err.contains("invalid HTTP method"), "got: {}", err);
         std::fs::remove_file(&p).ok();
     }
 
