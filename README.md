@@ -279,7 +279,7 @@ curl http://127.0.0.1:18443/_doorman/health
 It returns a versioned response containing readiness and credential names only:
 
 ```json
-{"schema_version":1,"ok":true,"version":"0.1.10","credentials":["github","stripe"]}
+{"schema_version":1,"ok":true,"version":"0.1.11","credentials":["github","stripe"]}
 ```
 
 The endpoint is disabled when `--listen` binds a non-loopback address. `doormand list` provides a convenient client and exits non-zero when the daemon is unavailable or unhealthy:
