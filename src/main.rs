@@ -16,6 +16,19 @@
 //       binding the port, opening the audit log, or touching an upstream.
 //       Lets setup flows catch a typo before restarting a live daemon.
 //
+//   doormand inspect [--config PATH] [--json] [--with-inject]
+//       Print the validated, non-sensitive policy. Secrets are never included;
+//       the injection template is opt-in because it reveals the header name.
+//
+//   doormand audit tail [-n COUNT] [--audit PATH]
+//   doormand audit last-error [--audit PATH]
+//       Read recent audit activity while projecting records onto the known,
+//       non-sensitive fields. Unknown fields are never echoed.
+//
+//   doormand list [--address ADDR] [--json]
+//       Query the running daemon's loopback health endpoint and print its
+//       loaded credential names.
+//
 //   doormand fingerprint <host[:port]>
 //       Print `sha256:<hex>` of an upstream's leaf cert, for pasting into a
 //       credential's `tls_pinned_sha256` field.
@@ -29,6 +42,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use doorman::{audit, config, hardening, proxy};
+use serde::Serialize;
 
 const DEFAULT_CONFIG: &str = "/etc/doorman/doorman.yaml";
 const DEFAULT_AUDIT: &str = "/var/log/doorman/audit.log";
@@ -42,6 +56,9 @@ fn main() -> ExitCode {
         "install-service" => cmd_install_service(rest),
         "run" => cmd_run(rest),
         "validate-config" => cmd_validate_config(rest),
+        "inspect" => cmd_inspect(rest),
+        "audit" => cmd_audit(rest),
+        "list" => cmd_list(rest),
         "fingerprint" => cmd_fingerprint(rest),
         "" | "-h" | "--help" => {
             print_usage();
@@ -66,9 +83,13 @@ fn print_usage() {
     eprintln!(
         "doormand — an HTTP proxy that holds your API keys.\n\n\
          usage:\n  \
-           doormand install-service [--bin-path PATH]\n  \
+           doormand install-service [--user] [--bin-path PATH]\n  \
            doormand run [--config PATH] [--audit PATH] [--listen ADDR] [--allow-same-uid]\n  \
            doormand validate-config [--config PATH] [--insecure-skip-mode-check]\n  \
+           doormand inspect [--config PATH] [--json] [--with-inject] [--insecure-skip-mode-check]\n  \
+           doormand audit tail [-n COUNT] [--audit PATH]\n  \
+           doormand audit last-error [--audit PATH]\n  \
+           doormand list [--address ADDR] [--json]\n  \
            doormand fingerprint <host[:port]>\n"
     );
 }
@@ -82,6 +103,7 @@ fn cmd_install_service(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("locate self: {}", e))?
         .display()
         .to_string();
+    let mut user_scope = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -92,10 +114,25 @@ fn cmd_install_service(args: &[String]) -> Result<(), String> {
                     .clone();
                 i += 2;
             }
+            "--user" => {
+                user_scope = true;
+                i += 1;
+            }
             other => return Err(format!("install-service: unknown flag {:?}", other)),
         }
     }
-    if cfg!(target_os = "macos") {
+    if user_scope {
+        let home = std::env::var("HOME")
+            .map_err(|_| "install-service --user: HOME is not set".to_string())?;
+        let config = PathBuf::from(&home).join(".config/doorman/doorman.yaml");
+        let state = PathBuf::from(&home).join(".local/state/doorman");
+        let audit = state.join("audit.log");
+        if cfg!(target_os = "macos") {
+            print_user_launchd_plist(&bin, &config, &state, &audit);
+        } else {
+            print_user_systemd_unit(&bin, &config, &audit);
+        }
+    } else if cfg!(target_os = "macos") {
         print_launchd_plist(&bin);
     } else {
         print_systemd_unit(&bin);
@@ -119,6 +156,79 @@ fn print_systemd_unit(bin: &str) {
 fn print_launchd_plist(bin: &str) {
     println!("<!-- launchd plist (write to /Library/LaunchDaemons/com.doorman.doormand.plist, owner root:wheel, mode 0644) -->");
     print!("{}", LAUNCHD_TEMPLATE.replace("__BIN_PATH__", bin));
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn systemd_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn print_user_systemd_unit(bin: &str, config: &std::path::Path, audit: &std::path::Path) {
+    println!("# systemd user unit (write to ~/.config/systemd/user/doormand.service):");
+    println!("[Unit]");
+    println!("Description=doorman HTTP credential proxy (user service)");
+    println!("After=network.target");
+    println!();
+    println!("[Service]");
+    println!(
+        "ExecStart={} run --config {} --audit {}",
+        systemd_quote(bin),
+        systemd_quote(&config.display().to_string()),
+        systemd_quote(&audit.display().to_string())
+    );
+    println!("Restart=on-failure");
+    println!("RestartSec=2s");
+    println!("NoNewPrivileges=true");
+    println!("PrivateTmp=true");
+    println!();
+    println!("[Install]");
+    println!("WantedBy=default.target");
+}
+
+fn print_user_launchd_plist(
+    bin: &str,
+    config: &std::path::Path,
+    state: &std::path::Path,
+    audit: &std::path::Path,
+) {
+    let bin = xml_escape(bin);
+    let config = xml_escape(&config.display().to_string());
+    let state = xml_escape(&state.display().to_string());
+    let audit = xml_escape(&audit.display().to_string());
+    println!("<!-- launchd user agent (write to ~/Library/LaunchAgents/com.doorman.doormand.plist, mode 0644) -->");
+    println!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    println!("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">");
+    println!("<plist version=\"1.0\">");
+    println!("<dict>");
+    println!("  <key>Label</key><string>com.doorman.doormand</string>");
+    println!("  <key>ProgramArguments</key>");
+    println!("  <array>");
+    println!("    <string>{}</string>", bin);
+    println!("    <string>run</string>");
+    println!("    <string>--config</string><string>{}</string>", config);
+    println!("    <string>--audit</string><string>{}</string>", audit);
+    println!("  </array>");
+    println!("  <key>RunAtLoad</key><true/>");
+    println!("  <key>KeepAlive</key><true/>");
+    println!(
+        "  <key>StandardOutPath</key><string>{}/stdout.log</string>",
+        state
+    );
+    println!(
+        "  <key>StandardErrorPath</key><string>{}/stderr.log</string>",
+        state
+    );
+    println!("  <key>ProcessType</key><string>Background</string>");
+    println!("</dict>");
+    println!("</plist>");
 }
 
 /// Parse a `fingerprint` CLI target into `(host, port)`. Bracketed IPv6
@@ -306,6 +416,278 @@ fn cmd_validate_config(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct InspectedEntry<'a> {
+    name: &'a str,
+    hosts: &'a [String],
+    methods: &'a [String],
+    port: u16,
+    tls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_pinned_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inject: Option<String>,
+}
+
+/// Print only the policy portions of a validated config. This deliberately
+/// builds a separate serialization type with no `secret` field, rather than
+/// serializing `config::Entry` and trying to redact it afterward.
+fn cmd_inspect(args: &[String]) -> Result<(), String> {
+    let mut config_path = PathBuf::from(DEFAULT_CONFIG);
+    let mut enforce_0400 = true;
+    let mut json = false;
+    let mut with_inject = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                config_path = PathBuf::from(args.get(i + 1).ok_or("missing value for --config")?);
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--with-inject" => {
+                with_inject = true;
+                i += 1;
+            }
+            "--insecure-skip-mode-check" => {
+                enforce_0400 = false;
+                i += 1;
+            }
+            other => return Err(format!("inspect: unknown flag {:?}", other)),
+        }
+    }
+
+    let cfg = config::load(&config_path, enforce_0400)?;
+    let policy: Vec<InspectedEntry<'_>> = cfg
+        .entries
+        .iter()
+        .map(|entry| InspectedEntry {
+            name: &entry.name,
+            hosts: &entry.hosts,
+            methods: &entry.methods,
+            port: entry.port,
+            tls: entry.tls,
+            tls_pinned_sha256: entry.tls_pin.as_ref().map(|pin| proxy::hex(pin.as_slice())),
+            inject: with_inject.then(|| {
+                format!(
+                    "{}: {}{{}}{}",
+                    entry.header_name, entry.header_prefix, entry.header_suffix
+                )
+            }),
+        })
+        .collect();
+
+    let output = if json {
+        serde_json::to_string_pretty(&policy).map_err(|e| format!("serialize JSON: {}", e))?
+    } else {
+        serde_yaml::to_string(&policy).map_err(|e| format!("serialize YAML: {}", e))?
+    };
+    println!("{}", output.trim_end());
+    Ok(())
+}
+
+fn cmd_audit(args: &[String]) -> Result<(), String> {
+    use std::collections::VecDeque;
+    use std::io::{BufRead, BufReader};
+
+    let action = args
+        .first()
+        .ok_or("audit: expected 'tail' or 'last-error'")?;
+    if action != "tail" && action != "last-error" {
+        return Err(format!("audit: unknown action {:?}", action));
+    }
+
+    let mut audit_path = PathBuf::from(DEFAULT_AUDIT);
+    let mut count: usize = 50;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--audit" => {
+                audit_path = PathBuf::from(args.get(i + 1).ok_or("missing value for --audit")?);
+                i += 2;
+            }
+            "-n" if action == "tail" => {
+                let raw = args.get(i + 1).ok_or("missing value for -n")?;
+                count = raw
+                    .parse()
+                    .map_err(|_| format!("audit tail: invalid count {:?}", raw))?;
+                i += 2;
+            }
+            flag => return Err(format!("audit {}: unknown flag {:?}", action, flag)),
+        }
+    }
+
+    let file = std::fs::File::open(&audit_path)
+        .map_err(|e| format!("open audit log {}: {}", audit_path.display(), e))?;
+    let mut selected = VecDeque::new();
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| {
+            format!(
+                "read audit log {} line {}: {}",
+                audit_path.display(),
+                line_no + 1,
+                e
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| {
+            format!(
+                "parse audit log {} line {}: {}",
+                audit_path.display(),
+                line_no + 1,
+                e
+            )
+        })?;
+        if action == "last-error" && !audit_record_is_error(&value) {
+            continue;
+        }
+        if count == 0 && action == "tail" {
+            continue;
+        }
+        selected.push_back(safe_audit_record(&value));
+        let keep = if action == "last-error" { 1 } else { count };
+        while selected.len() > keep {
+            selected.pop_front();
+        }
+    }
+
+    if action == "last-error" && selected.is_empty() {
+        return Err(format!(
+            "audit last-error: no denied or non-2xx record in {}",
+            audit_path.display()
+        ));
+    }
+    for record in selected {
+        println!(
+            "{}",
+            serde_json::to_string(&record).map_err(|e| format!("serialize audit record: {}", e))?
+        );
+    }
+    Ok(())
+}
+
+fn audit_record_is_error(value: &serde_json::Value) -> bool {
+    value.get("decision").and_then(|v| v.as_str()) == Some("deny")
+        || value
+            .get("status")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|status| !(200..300).contains(&status))
+}
+
+/// Copy only the audit schema's documented diagnostic fields. This remains
+/// safe even if a malformed or future audit producer adds a secret-bearing
+/// field: unknown input fields are never reflected to stdout.
+fn safe_audit_record(value: &serde_json::Value) -> serde_json::Value {
+    const SAFE_FIELDS: &[&str] = &[
+        "ts", "event", "cred", "host", "method", "path", "status", "decision", "reason", "protocol",
+    ];
+    let mut safe = serde_json::Map::new();
+    for field in SAFE_FIELDS {
+        if let Some(field_value) = value.get(*field) {
+            safe.insert((*field).to_string(), field_value.clone());
+        }
+    }
+    serde_json::Value::Object(safe)
+}
+
+fn cmd_list(args: &[String]) -> Result<(), String> {
+    use std::io::{Read, Write};
+
+    let mut address: SocketAddr = DEFAULT_LISTEN
+        .parse()
+        .map_err(|e| format!("default daemon address: {}", e))?;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--address" => {
+                let raw = args.get(i + 1).ok_or("missing value for --address")?;
+                address = raw
+                    .parse()
+                    .map_err(|e| format!("--address {:?}: {}", raw, e))?;
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other => return Err(format!("list: unknown flag {:?}", other)),
+        }
+    }
+    if !address.ip().is_loopback() {
+        return Err("list: --address must be a loopback address".into());
+    }
+
+    let mut stream = std::net::TcpStream::connect(address)
+        .map_err(|e| format!("connect to doorman at {}: {}", address, e))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("set read timeout: {}", e))?;
+    let host = match address.ip() {
+        std::net::IpAddr::V4(ip) => format!("{}:{}", ip, address.port()),
+        std::net::IpAddr::V6(ip) => format!("[{}]:{}", ip, address.port()),
+    };
+    write!(
+        stream,
+        "GET /_doorman/health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host
+    )
+    .map_err(|e| format!("query doorman: {}", e))?;
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            // Some small HTTP servers close with a TCP reset after writing a
+            // complete `Connection: close` response. Treat that as EOF only
+            // after bytes have arrived; parsing below still validates that a
+            // complete status line, headers, and JSON body were received.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !response.is_empty() => {
+                break;
+            }
+            Err(e) => return Err(format!("read doorman response: {}", e)),
+        }
+    }
+    let response =
+        String::from_utf8(response).map_err(|e| format!("response is not UTF-8: {}", e))?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("malformed response from doorman")?;
+    if !head.starts_with("HTTP/1.1 200 ") {
+        let status = head.lines().next().unwrap_or("unknown status");
+        return Err(format!("health endpoint returned {}", status));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("parse health response: {}", e))?;
+    if value.get("schema_version").and_then(|v| v.as_u64()) != Some(1)
+        || value.get("ok").and_then(|v| v.as_bool()) != Some(true)
+    {
+        return Err("unsupported or unhealthy response from doorman".into());
+    }
+    let credentials = value
+        .get("credentials")
+        .and_then(|v| v.as_array())
+        .ok_or("health response has no credentials array")?;
+    if json {
+        println!("{}", serde_json::json!({ "credentials": credentials }));
+    } else {
+        for credential in credentials {
+            let name = credential
+                .as_str()
+                .ok_or("health response contains a non-string credential name")?;
+            println!("{}", name);
+        }
+    }
+    Ok(())
+}
+
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG);
     let mut audit_path = PathBuf::from(DEFAULT_AUDIT);
@@ -377,30 +759,16 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // owning uid can rewrite it — so this is where a change becomes visible.
     // Best-effort: a failure here is logged but doesn't block startup, since
     // per-request auditing is the fail-closed path.
-    match std::fs::read(&config_path) {
-        Ok(bytes) => {
-            let fingerprint = proxy::hex(&proxy::sha256(&bytes));
-            let names: Vec<String> = cfg.entries.iter().map(|e| e.name.clone()).collect();
-            if let Err(e) = audit.write_config_load(&audit::ConfigLoad {
-                ts: audit::now_rfc3339(),
-                event: "config_load",
-                config_sha256: &fingerprint,
-                credentials: &names,
-            }) {
-                eprintln!("doormand: audit config_load write failed: {}", e);
-            }
-        }
-        Err(e) => eprintln!(
-            "doormand: could not re-read config for audit fingerprint: {}",
-            e
-        ),
-    }
+    audit_loaded_config(&audit, &config_path, &cfg);
 
+    let policy = Arc::new(std::sync::RwLock::new(proxy::RuntimePolicy {
+        config: cfg,
+        upstream_tls_pinned,
+    }));
     let server = proxy::Server {
-        config: Arc::new(cfg),
+        policy: Arc::clone(&policy),
         audit: Arc::clone(&audit),
         upstream_tls,
-        upstream_tls_pinned,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -417,9 +785,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         let sigint = async {
             tokio::signal::ctrl_c().await.ok();
         };
-        // SIGHUP triggers an audit-log re-open so external rotators can move
-        // the current log aside and have us pick up the new file.
+        // SIGHUP reopens the audit log and attempts an atomic policy reload.
+        // A failed validation leaves the last known-good policy untouched.
         let audit_for_sighup = Arc::clone(&audit);
+        let policy_for_sighup = Arc::clone(&policy);
+        let config_for_sighup = config_path.clone();
         let sighup = async move {
             let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
                 .expect("install SIGHUP handler");
@@ -427,6 +797,28 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
                 match audit_for_sighup.reopen() {
                     Ok(()) => eprintln!("SIGHUP, audit log reopened"),
                     Err(e) => eprintln!("SIGHUP, audit reopen failed: {}", e),
+                }
+                match config::load(&config_for_sighup, enforce_0400) {
+                    Ok(new_config) => {
+                        let new_pinned = proxy::upstream_tls_pinned(&new_config);
+                        let count = new_config.entries.len();
+                        let config_for_audit = new_config.clone();
+                        *policy_for_sighup.write().expect("policy lock poisoned") =
+                            proxy::RuntimePolicy {
+                                config: new_config,
+                                upstream_tls_pinned: new_pinned,
+                            };
+                        audit_loaded_config(
+                            &audit_for_sighup,
+                            &config_for_sighup,
+                            &config_for_audit,
+                        );
+                        eprintln!("SIGHUP, config reloaded ({} credentials)", count);
+                    }
+                    Err(e) => eprintln!(
+                        "SIGHUP, config reload rejected; keeping previous policy: {}",
+                        e
+                    ),
                 }
             }
         };
@@ -437,6 +829,27 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             _ = sighup => { Ok(()) }
         }
     })
+}
+
+fn audit_loaded_config(audit: &audit::Audit, config_path: &std::path::Path, cfg: &config::Config) {
+    match std::fs::read(config_path) {
+        Ok(bytes) => {
+            let fingerprint = proxy::hex(&proxy::sha256(&bytes));
+            let names: Vec<String> = cfg.entries.iter().map(|entry| entry.name.clone()).collect();
+            if let Err(e) = audit.write_config_load(&audit::ConfigLoad {
+                ts: audit::now_rfc3339(),
+                event: "config_load",
+                config_sha256: &fingerprint,
+                credentials: &names,
+            }) {
+                eprintln!("doormand: audit config_load write failed: {}", e);
+            }
+        }
+        Err(e) => eprintln!(
+            "doormand: could not read config for audit fingerprint: {}",
+            e
+        ),
+    }
 }
 
 #[cfg(test)]

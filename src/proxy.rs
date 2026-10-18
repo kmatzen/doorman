@@ -39,6 +39,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -72,36 +73,43 @@ const CRED_HEADER: &str = "x-doorman-cred";
 
 #[derive(Clone)]
 pub struct Server {
-    pub config: Arc<Config>,
+    /// Config and its derived pinned TLS clients are swapped under one lock
+    /// so a request can never observe half of a reload.
+    pub policy: Arc<RwLock<RuntimePolicy>>,
     pub audit: Arc<Audit>,
     /// `ClientConfig` used for credentials that do plain webpki chain
     /// validation (the historical default).
     pub upstream_tls: Arc<rustls::ClientConfig>,
-    /// Per-credential `ClientConfig`s, populated only for entries that pin
-    /// a leaf cert SHA-256. Each one carries a [`PinVerifier`] in place of
-    /// webpki chain validation. Keyed by credential name.
+}
+
+pub struct RuntimePolicy {
+    pub config: Config,
     pub upstream_tls_pinned: Arc<HashMap<String, Arc<rustls::ClientConfig>>>,
 }
 
 impl Server {
-    /// Pick the right TLS client config for an entry. Returns `None` for
-    /// entries that don't do TLS at all (`tls: false`), which is a caller
-    /// signal to dial plain TCP.
-    fn tls_for(&self, entry: &Entry) -> Option<Arc<rustls::ClientConfig>> {
-        if !entry.tls {
-            return None;
-        }
-        if entry.tls_pin.is_some() {
-            // The map is built from the same config at startup, so a missing
-            // entry here is a programmer error — `expect` rather than fall
-            // back to webpki, which would be a silent downgrade.
-            let cfg = self
-                .upstream_tls_pinned
-                .get(&entry.name)
-                .expect("pinned entry has no precomputed ClientConfig");
-            return Some(Arc::clone(cfg));
-        }
-        Some(Arc::clone(&self.upstream_tls))
+    /// Snapshot a credential and its transport config under the same read
+    /// lock. This keeps an in-flight request internally consistent across a
+    /// concurrent policy reload.
+    fn credential_snapshot(
+        &self,
+        name: &str,
+    ) -> Option<(Entry, Option<Arc<rustls::ClientConfig>>)> {
+        let policy = self.policy.read().expect("policy lock poisoned");
+        let entry = policy.config.lookup(name)?.clone();
+        let tls = if !entry.tls {
+            None
+        } else if entry.tls_pin.is_some() {
+            Some(Arc::clone(
+                policy
+                    .upstream_tls_pinned
+                    .get(name)
+                    .expect("pinned entry has no precomputed ClientConfig"),
+            ))
+        } else {
+            Some(Arc::clone(&self.upstream_tls))
+        };
+        Some((entry, tls))
     }
 }
 
@@ -119,6 +127,10 @@ pub async fn run(server: Server, listen: SocketAddr) -> Result<(), String> {
 /// Serve on a pre-bound listener. Tests use this to bind on `127.0.0.1:0`
 /// and then learn the assigned port via `local_addr()`.
 pub async fn serve_listener(server: Server, listener: TcpListener) -> Result<(), String> {
+    let admin_enabled = listener
+        .local_addr()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false);
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -129,17 +141,21 @@ pub async fn serve_listener(server: Server, listener: TcpListener) -> Result<(),
         };
         let s = server.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(s, stream).await {
+            if let Err(e) = handle_connection(s, stream, admin_enabled).await {
                 eprintln!("connection {}: {}", peer_addr, e);
             }
         });
     }
 }
 
-async fn handle_connection(server: Server, stream: TcpStream) -> Result<(), String> {
+async fn handle_connection(
+    server: Server,
+    stream: TcpStream,
+    admin_enabled: bool,
+) -> Result<(), String> {
     let svc = service_fn(move |req: Request<Incoming>| {
         let server = server.clone();
-        async move { Ok::<_, Infallible>(serve(server, req).await) }
+        async move { Ok::<_, Infallible>(serve(server, req, admin_enabled).await) }
     });
     server_http1::Builder::new()
         .serve_connection(TokioIo::new(stream), svc)
@@ -153,9 +169,22 @@ async fn handle_connection(server: Server, stream: TcpStream) -> Result<(), Stri
 
 /// One inbound HTTP request from the agent. Returns either a doorman 4xx/5xx
 /// or the streamed upstream response.
-async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody> {
+async fn serve(
+    server: Server,
+    mut req: Request<Incoming>,
+    admin_enabled: bool,
+) -> Response<ProxyBody> {
     let started = Instant::now();
     let method = req.method().clone();
+
+    // The readiness endpoint exists only when the listener itself is bound
+    // to loopback, and only when the request targets a loopback authority.
+    // This prevents `--listen 0.0.0.0:...` from accidentally publishing the
+    // loaded credential names and avoids intercepting the same path on a
+    // legitimate upstream host.
+    if admin_enabled && is_local_health_request(&req) {
+        return health_response(&server);
+    }
 
     // CONNECT is the classic HTTPS_PROXY / wss:// misconfiguration: doorman
     // is a strict forward proxy that reads http:// requests and
@@ -214,8 +243,11 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
         }
     };
 
-    let entry = match server.config.lookup(&cred_name) {
-        Some(e) => e,
+    // Clone the selected entry while holding the read lock, then release it
+    // before any network await. Existing requests keep this immutable
+    // snapshot while a reload affects only requests that begin afterward.
+    let (entry, entry_tls) = match server.credential_snapshot(&cred_name) {
+        Some(snapshot) => snapshot,
         None => {
             return deny(
                 &server,
@@ -298,7 +330,8 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
         let upstream_req = Request::from_parts(parts, Empty::<Bytes>::new());
         return relay_upgrade(
             &server,
-            entry,
+            &entry,
+            entry_tls,
             target_host,
             cred_name,
             method.as_str().to_string(),
@@ -318,7 +351,8 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
     };
     let upstream_req = Request::from_parts(parts, req_body);
 
-    let upstream_response = match send_upstream(&server, &target_host, entry, upstream_req).await {
+    let upstream_response = match send_upstream(&target_host, &entry, entry_tls, upstream_req).await
+    {
         Ok(r) => r,
         Err(e) => {
             return deny(
@@ -344,6 +378,40 @@ async fn serve(server: Server, mut req: Request<Incoming>) -> Response<ProxyBody
         bytes_in_counter,
         started,
     )
+}
+
+fn is_local_health_request(req: &Request<Incoming>) -> bool {
+    if req.method() != hyper::Method::GET || req.uri().path() != "/_doorman/health" {
+        return false;
+    }
+    matches!(
+        resolve_target_host(req).as_deref(),
+        Some("localhost" | "127.0.0.1" | "::1")
+    )
+}
+
+fn health_response(server: &Server) -> Response<ProxyBody> {
+    let policy = server.policy.read().expect("policy lock poisoned");
+    let credentials: Vec<&str> = policy
+        .config
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "credentials": credentials,
+    })
+    .to_string()
+        + "\n";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .body(full_body(Bytes::from(body)))
+        .unwrap()
 }
 
 /// True for an HTTP/1.1 Upgrade request: a `Connection` header that lists the
@@ -427,6 +495,7 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap, is_upgrade: bool) {
 async fn relay_upgrade(
     server: &Server,
     entry: &Entry,
+    entry_tls: Option<Arc<rustls::ClientConfig>>,
     target_host: String,
     cred_name: String,
     method: String,
@@ -435,22 +504,22 @@ async fn relay_upgrade(
     agent_upgrade: hyper::upgrade::OnUpgrade,
     started: Instant,
 ) -> Response<ProxyBody> {
-    let mut upstream_response = match send_upstream(server, &target_host, entry, upstream_req).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return deny(
-                server,
-                &target_host,
-                &method,
-                &path,
-                Some(&cred_name),
-                StatusCode::BAD_GATEWAY,
-                Some(&format!("upstream: {}", e)),
-                started,
-            );
-        }
-    };
+    let mut upstream_response =
+        match send_upstream(&target_host, entry, entry_tls, upstream_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                return deny(
+                    server,
+                    &target_host,
+                    &method,
+                    &path,
+                    Some(&cred_name),
+                    StatusCode::BAD_GATEWAY,
+                    Some(&format!("upstream: {}", e)),
+                    started,
+                );
+            }
+        };
 
     if upstream_response.status() != StatusCode::SWITCHING_PROTOCOLS {
         // Upstream declined the upgrade (404, 426, 401, …). Relay it back as a
@@ -494,7 +563,8 @@ async fn relay_upgrade(
                 // here it would be invisible in the audit trail: "every
                 // request produces a line" would silently not hold for a
                 // handshake that fails to complete after the 101.
-                let rec = incomplete_upgrade_record(&cred_name, &target_host, &method, &path, started);
+                let rec =
+                    incomplete_upgrade_record(&cred_name, &target_host, &method, &path, started);
                 if let Err(e) = audit.write(&rec) {
                     eprintln!("audit write failed for incomplete websocket upgrade: {}", e);
                 }
@@ -694,9 +764,9 @@ fn find_credential(headers: &hyper::HeaderMap) -> Result<String, &'static str> {
 }
 
 async fn send_upstream<B>(
-    server: &Server,
     target_host: &str,
     entry: &Entry,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
     req: Request<B>,
 ) -> Result<Response<Incoming>, String>
 where
@@ -718,7 +788,7 @@ where
     // (when the credential pins a SHA-256) the precomputed pinned config.
     // `entry.tls = false` is for LAN devices that expose plain HTTP;
     // we hand the raw TCP stream to hyper directly.
-    match server.tls_for(entry) {
+    match tls_config {
         Some(tls_cfg) => {
             let server_name: ServerName<'static> = ServerName::try_from(target_host.to_string())
                 .map_err(|e| format!("server name {:?}: {}", target_host, e))?;
@@ -1160,7 +1230,8 @@ mod tests {
 
     #[test]
     fn incomplete_upgrade_record_shape() {
-        let rec = incomplete_upgrade_record("mycred", "example.com", "GET", "/chat", Instant::now());
+        let rec =
+            incomplete_upgrade_record("mycred", "example.com", "GET", "/chat", Instant::now());
         assert_eq!(rec.cred, Some("mycred"));
         assert_eq!(rec.host, "example.com");
         assert_eq!(rec.method, "GET");

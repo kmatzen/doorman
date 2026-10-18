@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::net::Ipv6Addr;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -130,16 +131,12 @@ pub fn load(path: &Path, enforce_mode_0400: bool) -> Result<Config, String> {
     }
     let raw = fs::read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
-            // The usual cause under a service: the config is owned by root (or
-            // some other uid) but the daemon runs as a dedicated, unprivileged
-            // uid that can't read it. Spell that out — it's exactly the failure
-            // that otherwise shows up as a bare "exit 1" in the service log.
-            format!(
-                "read {}: {} — the config must be owned by and readable by the uid \
-                 doorman runs as (under the systemd unit / launchd plist that is a \
-                 dedicated uid, not root); check the file's owner and mode",
-                path.display(),
-                e
+            permission_denied_message(
+                path,
+                &e,
+                meta.uid(),
+                unsafe { libc::geteuid() },
+                cfg!(target_os = "macos"),
             )
         } else {
             format!("read {}: {}", path.display(), e)
@@ -160,6 +157,38 @@ pub fn load(path: &Path, enforce_mode_0400: bool) -> Result<Config, String> {
         out.push(entry);
     }
     Ok(Config { entries: out })
+}
+
+fn permission_denied_message(
+    path: &Path,
+    error: &std::io::Error,
+    owner_uid: u32,
+    effective_uid: u32,
+    macos: bool,
+) -> String {
+    let base = format!(
+        "read {}: {} — config owner uid {}; daemon uid {}",
+        path.display(),
+        error,
+        owner_uid,
+        effective_uid
+    );
+    if macos && effective_uid >= 500 && owner_uid != effective_uid {
+        return format!(
+            "{}; a Homebrew/user LaunchAgent runs as the login user and cannot read a \
+             mode-0400 config owned by _doorman. For dedicated-uid isolation, install \
+             the system LaunchDaemon with `sudo bash scripts/install-darwin.sh`, then \
+             chown the config to _doorman:_doorman. For convenience-tier use instead, \
+             use `doormand install-service --user` with a login-user-owned config under \
+             ~/.config/doorman",
+            base
+        );
+    }
+    format!(
+        "{}; the config must be owned by and readable by the uid doorman runs as; \
+         check the service account, file owner, and mode",
+        base
+    )
 }
 
 fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
@@ -662,5 +691,22 @@ mod tests {
             "expected a uid/permission hint, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn macos_login_uid_mismatch_names_both_supported_remediations() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = permission_denied_message(
+            Path::new("/opt/homebrew/etc/doorman/doorman.yaml"),
+            &err,
+            401,
+            501,
+            true,
+        );
+        assert!(message.contains("Homebrew/user LaunchAgent"), "{}", message);
+        assert!(message.contains("install-darwin.sh"), "{}", message);
+        assert!(message.contains("install-service --user"), "{}", message);
+        assert!(message.contains("owner uid 401"), "{}", message);
+        assert!(message.contains("daemon uid 501"), "{}", message);
     }
 }
