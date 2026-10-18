@@ -20,7 +20,10 @@ hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"
 http-body-util = "0.1"
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# 0.23.46 fixes RUSTSEC-2026-0285 plus the later RUSTSEC-2026-0346 through
+# -0349 advisories. Keep the lower bound on the patched release so a fresh
+# lockfile cannot silently reintroduce the vulnerable versions.
+rustls = { version = ">=0.23.46, <0.24", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "0.26"
 # Already pulled in transitively by rustls; declared here because the pin

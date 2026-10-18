@@ -44,6 +44,13 @@ brew install doorman
 
 > **The brew install is convenience-tier, not an isolation boundary.** It runs doorman under *your* user uid and the config is owned by you. Mode 0400 stops *other* users from reading it, but it does **not** isolate the secrets from other code running as you: any process with your uid can read the file, and (since you own it) can `chmod u+w` and rewrite it. For a real boundary — doorman running under a dedicated, unprivileged uid that your app code never runs as — use the systemd unit (Linux, `User=doorman`) or `install-darwin.sh` (macOS, creates `_doorman`); see [From a release tarball](#from-a-release-tarball) below. Either way, a restart records a config fingerprint in the [audit log](#audit-log), so out-of-band edits are at least visible.
 
+On macOS, do not combine `brew services start doorman` with an `_doorman`-owned mode-0400 config: Homebrew's user LaunchAgent runs as your login uid and cannot read that file, so launchd will repeatedly restart it after exit 1. Choose one complete deployment:
+
+- For isolation, do not use the Homebrew user service; install the system LaunchDaemon with `sudo bash scripts/install-darwin.sh` and make `_doorman:_doorman` own the config.
+- For rootless convenience, make your login user own `~/.config/doorman/doorman.yaml` and use `doormand install-service --user` as documented below.
+
+If these are mixed accidentally, startup now reports the config owner uid, daemon uid, and both remediation paths in the service error log.
+
 ### Quick install (curl)
 
 ```
@@ -65,6 +72,15 @@ curl -fsSL https://github.com/kmatzen/doorman/releases/latest/download/install.s
 ```
 
 `DOORMAN_VERSION` defaults to the latest release tag; `DOORMAN_PREFIX` defaults to `/usr/local/bin`. `DOORMAN_REQUIRE_ATTESTATION=1` makes the installer refuse to proceed unless it can verify sigstore provenance (tarball or `SHA256SUMS`) via `gh attestation verify`, instead of falling back to a bare checksum match — worth setting in CI/image builds where you want a hard failure rather than a warning.
+
+For CI and image builds, pin the release so a rebuild cannot silently pick up a newer version. Replace `vX.Y.Z` with the exact release tag:
+
+```
+curl -fsSL https://github.com/kmatzen/doorman/releases/download/vX.Y.Z/install.sh \
+  | DOORMAN_VERSION=vX.Y.Z DOORMAN_REQUIRE_ATTESTATION=1 sh
+```
+
+The installer verifies the selected tarball against that release's published `SHA256SUMS`; with `DOORMAN_REQUIRE_ATTESTATION=1`, it also requires verified build provenance.
 
 ### From a release tarball
 
@@ -129,6 +145,33 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.doorman.doormand.plis
 
 macOS's hardening primitives are weaker than systemd's; `_doorman` runs as a separate uid but you don't get the equivalent of `NoNewPrivileges` etc.
 
+#### Rootless user service
+
+For convenience-tier development, `install-service --user` emits a service that runs as the current login user and uses user-owned paths. It does not install or write anything itself:
+
+**Linux:**
+
+```
+mkdir -p ~/.config/doorman ~/.config/systemd/user ~/.local/state/doorman
+chmod 0700 ~/.config/doorman ~/.local/state/doorman
+chmod 0400 ~/.config/doorman/doorman.yaml
+doormand install-service --user > ~/.config/systemd/user/doormand.service
+systemctl --user daemon-reload
+systemctl --user enable --now doormand
+```
+
+**macOS:**
+
+```
+mkdir -p ~/.config/doorman ~/.local/state/doorman ~/Library/LaunchAgents
+chmod 0700 ~/.config/doorman ~/.local/state/doorman
+chmod 0400 ~/.config/doorman/doorman.yaml
+doormand install-service --user > ~/Library/LaunchAgents/com.doorman.doormand.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.doorman.doormand.plist
+```
+
+The emitted service reads `~/.config/doorman/doorman.yaml` and writes `~/.local/state/doorman/audit.log`. It can coexist with a system service only if one instance uses a different `--listen` address; the generated services both use the default `127.0.0.1:18443`, so stop the system instance before starting the user one. Because the agent and daemon share your login uid, this mode is not a credential-isolation boundary: other processes running as you can read the config. Prefer the dedicated-uid system service for production or adversarial agents.
+
 > **Service won't start (exits 1)?** The daemon runs as a dedicated uid (`_doorman` on macOS, `doorman` on Linux), so the config must be **owned by and readable by that uid**. A root-owned `0400` file fails with `read …: Permission denied` and the daemon exits 1. The error is in the service's stderr log:
 >
 > ```
@@ -148,6 +191,22 @@ doormand run \
 
 `--insecure-skip-mode-check` lets you use a config file that isn't mode 0400. Don't use it in production.
 
+| flag | what it does | intended use | if omitted |
+| --- | --- | --- | --- |
+| `--insecure-skip-mode-check` | Allows a config whose mode is not exactly 0400. It does not provide any other isolation. | Local development only, for a checkout-owned config. Never set it in a production service. | A loosely permissioned config is rejected at startup, before secrets are loaded. |
+| `--allow-same-uid` | Acknowledges that doorman and the agent share a uid and silences the startup warning. It does not make that arrangement secure. | Convenience-tier local use only. | A personal-login-uid process starts but emits a security warning; a dedicated service uid is unaffected. |
+
+In production, omit both flags and make the dedicated service uid the owner:
+
+```
+sudo install -d -o doorman -g doorman -m 0750 /etc/doorman
+sudo install -o doorman -g doorman -m 0400 doorman.yaml /etc/doorman/doorman.yaml
+doormand validate-config --config /etc/doorman/doorman.yaml
+sudo systemctl restart doormand
+```
+
+On macOS, substitute `_doorman:_doorman` and use the system LaunchDaemon installed by `scripts/install-darwin.sh`.
+
 ### Validate a config before restarting
 
 `validate-config` runs the full config validation — YAML syntax, the `inject` template shape, host/method allowlists, the `tls`/`tls_pinned_sha256` consistency rules, and the mode-0400 gate — without binding the proxy port, opening the audit log, or contacting any upstream. Run it before restarting a live daemon so a typo fails here instead of taking the proxy down:
@@ -157,6 +216,17 @@ doormand validate-config --config /etc/doorman/doorman.yaml
 ```
 
 On success it prints the loaded credential names (names only — never secrets) and exits 0; on any error it prints the problem and exits non-zero. Pass `--insecure-skip-mode-check` to validate a dev config that isn't mode 0400.
+
+### Inspect the non-sensitive policy
+
+`inspect` loads and validates the config, then prints the fields an integration needs without ever including credential secrets:
+
+```
+doormand inspect --config /etc/doorman/doorman.yaml
+doormand inspect --config /etc/doorman/doorman.yaml --json
+```
+
+The output includes each credential's `name`, `hosts`, `methods`, `port`, `tls`, and certificate pin when configured. An empty `methods` list means any method. The `inject` template is omitted by default; add `--with-inject` when the header name is safe to expose. As with `validate-config`, production configs retain the mode-0400 check, while local development may explicitly pass `--insecure-skip-mode-check`.
 
 ## Use
 
@@ -176,6 +246,49 @@ curl --proxy http://127.0.0.1:18443 \
 - Credential names must match config entries exactly (case-sensitive).
 - Doorman overwrites the `Authorization` header (or whatever the `inject` template targets); the agent can't influence it.
 - **Getting a `405 CONNECT is not supported`?** Something is set to `HTTPS_PROXY` instead of `HTTP_PROXY`, or the code is requesting an `https://`/`wss://` URL. That makes the client tunnel via `CONNECT`, which doorman — a strict `http://` forward proxy that re-originates TLS itself — never accepts. Unset `HTTPS_PROXY` and use `http://` URLs through `HTTP_PROXY`.
+
+See the copy-paste examples for the [GitHub API](examples/github-api.md) and an [internal HTTPS API](examples/internal-api.md), including least-privilege token scopes, read-only aliases, and self-signed certificate pinning.
+
+### Credential probes for integrations
+
+An integration that cannot read the protected config can determine whether a credential name is loaded by making a request through doorman to a reserved `.invalid` host:
+
+```
+curl --proxy http://127.0.0.1:18443 \
+  -H 'X-Doorman-Cred: github' \
+  http://doorman-probe.invalid/
+```
+
+Doorman does not contact the fake host. Its 403 JSON response distinguishes the two cases:
+
+| response body | meaning |
+| --- | --- |
+| `{"error":"unknown credential"}` | The credential name is not loaded. |
+| `{"error":"host not allowlisted for credential"}` | The credential exists; the deliberately invalid host is outside its policy. |
+
+These exact error strings are a stable integration interface. This probe reveals only whether a guessed credential name exists; it never returns the secret or host allowlist. Operators who can read the protected config should prefer `doormand inspect --json`.
+
+### Readiness and loaded credential names
+
+When doorman is bound to a loopback address, its local health endpoint requires no credential:
+
+```
+curl http://127.0.0.1:18443/_doorman/health
+```
+
+It returns a versioned response containing readiness and credential names only:
+
+```json
+{"schema_version":1,"ok":true,"version":"0.1.10","credentials":["github","stripe"]}
+```
+
+The endpoint is disabled when `--listen` binds a non-loopback address. `doormand list` provides a convenient client and exits non-zero when the daemon is unavailable or unhealthy:
+
+```
+doormand list
+doormand list --json
+doormand list --address 127.0.0.1:18444
+```
 
 ### WebSocket upgrades
 
@@ -267,7 +380,7 @@ curl --proxy http://127.0.0.1:18443 \
 
 ### Updating a pin after a cert rotation
 
-Self-signed devices regenerate their cert on factory reset or some firmware updates. When that happens doorman will fail every request to that upstream with `tls connect: leaf cert SHA-256 does not match pin`. Re-run `doormand fingerprint <host>`, replace the value in the config, and `SIGHUP` is **not** enough — pinned configs are built once at startup, so restart the daemon.
+Self-signed devices regenerate their cert on factory reset or some firmware updates. When that happens doorman will fail every request to that upstream with `tls connect: leaf cert SHA-256 does not match pin`. Re-run `doormand fingerprint <host>`, replace the value in the config, and send `SIGHUP`; the reload rebuilds pinned TLS clients together with the credential policy.
 
 ## Audit log
 
@@ -292,13 +405,25 @@ One JSON line per request, fsync'd. Default path `/var/log/doorman/audit.log`, m
 
 No bodies, no headers, no secrets.
 
-At startup (and on any restart, which is how config changes take effect) doorman also writes one **config-load** line: a SHA-256 of the config file plus the credential names it defines — no secrets. Because edits happen out-of-band, this is where a config change shows up in the trail; a changed `config_sha256` between restarts means the credential set was edited.
+### Inspect recent activity
+
+Use the built-in helpers instead of printing raw log lines. They project each record onto the documented diagnostic fields, so unexpected fields are not echoed:
+
+```
+doormand audit tail -n 50
+doormand audit last-error
+doormand audit tail --audit /path/to/audit.log -n 10
+```
+
+`tail` prints the requested number of recent records. `last-error` prints the most recent denial or non-2xx response and exits non-zero when no such record exists. Output is newline-delimited JSON containing only timestamp, credential name, destination, method, path, status, decision/reason, event, and protocol when present.
+
+At startup and after every successful config reload, doorman also writes one **config-load** line: a SHA-256 of the config file plus the credential names it defines — no secrets. Because edits happen out-of-band, this is where a config change shows up in the trail.
 
 ```json
 {"ts":"2026-05-22T14:53:01Z","event":"config_load","config_sha256":"9f2b…","credentials":["github","stripe"]}
 ```
 
-**Rotation.** Doorman handles `SIGHUP` by re-opening the audit log file at the same path, so external rotators (logrotate, newsyslog) can move the current file aside and signal doorman to start writing a fresh one. Example logrotate stanza:
+**Reload and rotation.** `SIGHUP` validates and atomically reloads the config, including rebuilt pinned-TLS clients, without replacing the listening socket or interrupting in-flight requests. A request already in progress keeps its original immutable credential snapshot; new requests use the new policy. If parsing or validation fails, doorman logs the failure to stderr and keeps serving the previous policy. The same signal reopens the audit log, so external rotators can move the current file aside. Example logrotate stanza:
 
 ```
 /var/log/doorman/audit.log {
@@ -355,7 +480,7 @@ macOS's hardening primitives are weaker than systemd's. The `_doorman` user prov
 - **Upstream port comes from the credential's `port` field**, not the agent's URI. Defaults to 443.
 - **HTTP/1.1 only**, both sides. No HTTP/2.
 - **No upstream connection pooling.** One TLS handshake per upstream request, ~50ms cost.
-- **No config hot-reload.** Restart to pick up changes; restarts are sub-second. (`SIGHUP` reopens the audit log only.) Validate first with `doormand validate-config` so a typo fails before the restart, not after.
+- **Reload is signal-based.** Send `SIGHUP` after changing the config. Invalid replacements are rejected while the previous policy remains active; use `doormand validate-config` first for immediate operator feedback.
 - **`install-service` doesn't install.** It prints; you redirect.
 
 ## Testing

@@ -28,7 +28,7 @@ use tokio_rustls::TlsAcceptor;
 
 use doorman::audit::Audit;
 use doorman::config::{Config, Entry};
-use doorman::proxy::{serve_listener, Server};
+use doorman::proxy::{serve_listener, RuntimePolicy, Server};
 
 // --------------------------------------------------------------------------
 // Test CA: mints a leaf cert for the mock upstream and gives doorman a
@@ -178,10 +178,12 @@ async fn spawn_doorman_full(
     let _ = std::fs::remove_file(&audit_path);
     let audit = Audit::open(&audit_path).expect("open audit log");
     let server = Server {
-        config: Arc::new(Config { entries }),
+        policy: Arc::new(std::sync::RwLock::new(RuntimePolicy {
+            config: Config { entries },
+            upstream_tls_pinned,
+        })),
         audit: Arc::new(audit),
         upstream_tls,
-        upstream_tls_pinned,
     };
     tokio::spawn(async move {
         let _ = serve_listener(server, listener).await;
@@ -276,6 +278,50 @@ async fn request(
 // --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_endpoint_reports_loaded_names_without_credentials_or_upstream_call() {
+    let ca = TestCa::generate();
+    let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
+    let proxy = spawn_doorman(
+        vec![
+            entry(
+                "github",
+                "SECRET_MUST_NOT_LEAK",
+                "Authorization",
+                &["localhost"],
+                &[],
+                upstream_addr.port(),
+            ),
+            entry(
+                "stripe",
+                "ANOTHER_SECRET",
+                "Authorization",
+                &["localhost"],
+                &["GET"],
+                upstream_addr.port(),
+            ),
+        ],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, headers, body) =
+        request(proxy, Method::GET, "127.0.0.1", "/_doorman/health", vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["ok"], true);
+    assert_eq!(
+        value["credentials"],
+        serde_json::json!(["github", "stripe"])
+    );
+    let rendered = value.to_string();
+    assert!(!rendered.contains("SECRET_MUST_NOT_LEAK"));
+    assert!(!rendered.contains("ANOTHER_SECRET"));
+    assert!(captured.lock().unwrap().is_empty());
+}
 
 #[tokio::test]
 async fn allow_path_injects_secret_and_strips_cred_header() {
