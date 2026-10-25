@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
@@ -57,7 +57,8 @@ pub struct ConfigLoad<'a> {
 
 pub struct Audit {
     path: PathBuf,
-    file: Mutex<File>,
+    // Arc: write() hands the file to spawn_blocking, which cannot borrow self.
+    file: Arc<Mutex<File>>,
 }
 
 impl Audit {
@@ -71,30 +72,28 @@ impl Audit {
         let file = open_at(path)?;
         Ok(Audit {
             path: path.to_path_buf(),
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
         })
     }
 
-    /// Serialize, append, flush, fsync. Returns an error if any of those
-    /// fail; the caller must treat that as fail-closed.
-    pub fn write(&self, rec: &Record<'_>) -> Result<(), String> {
-        self.write_line(rec)
+    /// Append, flush and fsync on the blocking pool; an inline fsync parked
+    /// every tokio worker (~50 req/s on a 20ms-fsync volume). Fail-closed.
+    pub async fn write(&self, rec: &Record<'_>) -> Result<(), String> {
+        let buf = serialize_line(rec)?;
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || write_sync(&file, buf))
+            .await
+            .map_err(|e| format!("audit write task: {}", e))?
     }
 
-    /// Append a config-load line (fingerprint + credential names, no secrets).
-    /// Same durability as a request record.
+    /// Sync write for callers off an async worker: startup, and the audit callback after runtime shutdown.
+    pub fn write_blocking(&self, rec: &Record<'_>) -> Result<(), String> {
+        write_sync(&self.file, serialize_line(rec)?)
+    }
+
+    /// Config-load line (fingerprint + credential names, no secrets); sync because startup precedes the runtime.
     pub fn write_config_load(&self, rec: &ConfigLoad<'_>) -> Result<(), String> {
-        self.write_line(rec)
-    }
-
-    fn write_line<T: Serialize>(&self, value: &T) -> Result<(), String> {
-        let mut buf = serde_json::to_vec(value).map_err(|e| format!("serialize audit: {}", e))?;
-        buf.push(b'\n');
-        let mut f = self.file.lock().unwrap();
-        f.write_all(&buf)
-            .map_err(|e| format!("write audit: {}", e))?;
-        f.sync_data().map_err(|e| format!("fsync audit: {}", e))?;
-        Ok(())
+        write_sync(&self.file, serialize_line(rec)?)
     }
 
     /// Re-open the log file at the same path. Used on SIGHUP so external
@@ -108,6 +107,20 @@ impl Audit {
         *self.file.lock().unwrap() = new_file;
         Ok(())
     }
+}
+
+fn serialize_line<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    let mut buf = serde_json::to_vec(value).map_err(|e| format!("serialize audit: {}", e))?;
+    buf.push(b'\n');
+    Ok(buf)
+}
+
+fn write_sync(file: &Mutex<File>, buf: Vec<u8>) -> Result<(), String> {
+    let mut f = file.lock().unwrap();
+    f.write_all(&buf)
+        .map_err(|e| format!("write audit: {}", e))?;
+    f.sync_data().map_err(|e| format!("fsync audit: {}", e))?;
+    Ok(())
 }
 
 fn open_at(path: &Path) -> Result<File, String> {
@@ -163,19 +176,19 @@ mod tests {
     /// Models what logrotate does: doorman writes line A, rotator moves the
     /// file aside, doorman gets SIGHUP and reopens, doorman writes line B.
     /// Result: line A in the rotated file, line B in the fresh file.
-    #[test]
-    fn reopen_lets_external_rotator_swap_the_file() {
+    #[tokio::test]
+    async fn reopen_lets_external_rotator_swap_the_file() {
         let p = tmp_path();
         let p_rotated = p.with_extension("log.1");
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&p_rotated);
 
         let audit = Audit::open(&p).unwrap();
-        audit.write(&rec("allow")).unwrap();
+        audit.write(&rec("allow")).await.unwrap();
 
         std::fs::rename(&p, &p_rotated).unwrap();
         audit.reopen().unwrap();
-        audit.write(&rec("deny")).unwrap();
+        audit.write(&rec("deny")).await.unwrap();
 
         let rotated = std::fs::read_to_string(&p_rotated).unwrap();
         let fresh = std::fs::read_to_string(&p).unwrap();
