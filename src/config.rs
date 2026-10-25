@@ -280,6 +280,19 @@ fn parse_entry(idx: usize, r: RawEntry) -> Result<Entry, String> {
         ));
     }
 
+    // proxy.rs .expect()s this render is a valid header value, so fail at load; never echo it — it is the credential.
+    let rendered = format!("{}{}{}", header_prefix, r.secret, header_suffix);
+    if hyper::header::HeaderValue::try_from(rendered.as_str()).is_err() {
+        return Err(format!(
+            "{} {:?}: the auth header this entry would send is not a valid \
+             single-line HTTP header value (no CR/LF, ASCII) — a YAML block \
+             scalar (`secret: |`) keeps a trailing newline, so check `secret` \
+             and `inject` and prefer a quoted scalar",
+            where_(),
+            r.name
+        ));
+    }
+
     Ok(Entry {
         name: r.name,
         secret: r.secret,
@@ -410,6 +423,51 @@ mod tests {
         let p = dir.join(format!("doorman_cfg_{}_{}.yaml", std::process::id(), i));
         std::fs::write(&p, yaml).unwrap();
         p
+    }
+
+    #[test]
+    fn rejects_block_scalar_secret_with_trailing_newline() {
+        // `secret: |` keeps a trailing newline, which panicked the daemon on the first request.
+        let p = write_tmp("- name: github\n  secret: |\n    ghp_x\n  inject: 'Authorization: Bearer {}'\n  hosts: [api.github.com]\n");
+        let err = load(&p, false).unwrap_err();
+        assert!(
+            err.contains("github"),
+            "must name the credential, got: {}",
+            err
+        );
+        assert!(
+            err.contains("single-line HTTP header value"),
+            "got: {}",
+            err
+        );
+        assert!(
+            !err.contains("ghp_x"),
+            "secret leaked into the error: {}",
+            err
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn rejects_inject_suffix_containing_newline() {
+        // The newline can hide in the template's suffix as easily as in the secret.
+        let p = write_tmp("- name: a\n  secret: x\n  inject: \"X: {}\\n\"\n  hosts: [a.com]\n");
+        let err = load(&p, false).unwrap_err();
+        assert!(
+            err.contains("single-line HTTP header value"),
+            "got: {}",
+            err
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn plain_secret_with_spaces_still_loads() {
+        // Spaces and printable ASCII in a rendered value are legal: the gate must not bite.
+        let p = write_tmp("- name: a\n  secret: 'x y!#%&'\n  inject: 'Authorization: Bearer {}'\n  hosts: [a.com]\n");
+        let cfg = load(&p, false).unwrap();
+        assert_eq!(cfg.entries[0].render(), "Bearer x y!#%&");
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
