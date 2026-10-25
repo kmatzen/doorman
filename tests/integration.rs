@@ -160,7 +160,10 @@ async fn spawn_mock_upstream(server_tls: Arc<rustls::ServerConfig>) -> (SocketAd
 // Doorman under test: bind on a random port, serve in a background task.
 // --------------------------------------------------------------------------
 
-async fn spawn_doorman(entries: Vec<Entry>, upstream_tls: Arc<rustls::ClientConfig>) -> SocketAddr {
+async fn spawn_doorman(
+    entries: Vec<Entry>,
+    upstream_tls: Arc<rustls::ClientConfig>,
+) -> (SocketAddr, std::path::PathBuf) {
     spawn_doorman_full(entries, upstream_tls, Arc::new(HashMap::new())).await
 }
 
@@ -168,7 +171,7 @@ async fn spawn_doorman_full(
     entries: Vec<Entry>,
     upstream_tls: Arc<rustls::ClientConfig>,
     upstream_tls_pinned: Arc<HashMap<String, Arc<rustls::ClientConfig>>>,
-) -> SocketAddr {
+) -> (SocketAddr, std::path::PathBuf) {
     static N: AtomicU64 = AtomicU64::new(0);
     let i = N.fetch_add(1, Ordering::Relaxed);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -188,7 +191,7 @@ async fn spawn_doorman_full(
     tokio::spawn(async move {
         let _ = serve_listener(server, listener).await;
     });
-    addr
+    (addr, audit_path)
 }
 
 fn entry(
@@ -283,7 +286,7 @@ async fn request(
 async fn health_endpoint_reports_loaded_names_without_credentials_or_upstream_call() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![
             entry(
                 "github",
@@ -327,7 +330,7 @@ async fn health_endpoint_reports_loaded_names_without_credentials_or_upstream_ca
 async fn allow_path_injects_secret_and_strips_cred_header() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET_VALUE",
@@ -375,7 +378,7 @@ async fn connection_header_and_its_nominated_headers_are_stripped_from_requests(
     // upstream connection.
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET_VALUE",
@@ -429,7 +432,7 @@ async fn agent_authorization_header_is_overwritten() {
     // syntax involved at all), doorman's inject template overwrites it.
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "REAL_SECRET",
@@ -465,7 +468,7 @@ async fn agent_authorization_header_is_overwritten() {
 async fn deny_unknown_credential() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "real",
             "SECRET",
@@ -500,7 +503,7 @@ async fn deny_unknown_credential() {
 async fn deny_disallowed_host() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -532,7 +535,7 @@ async fn deny_disallowed_host() {
 async fn deny_disallowed_method() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -564,7 +567,7 @@ async fn deny_disallowed_method() {
 async fn deny_missing_cred_header() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -594,7 +597,7 @@ async fn deny_connect_even_with_valid_credential() {
     // doorman was never built to relay.
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -629,7 +632,7 @@ async fn deny_connect_even_with_valid_credential() {
 async fn deny_connect_without_credential() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -654,7 +657,7 @@ async fn deny_connect_without_credential() {
 async fn deny_multiple_cred_headers() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -692,7 +695,7 @@ async fn upstream_dial_failure_produces_valid_json_error_body() {
         drop(l);
         p
     };
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -726,7 +729,7 @@ async fn upstream_dial_failure_produces_valid_json_error_body() {
 async fn response_strips_set_cookie_and_www_authenticate() {
     let ca = TestCa::generate();
     let (upstream_addr, _) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -771,7 +774,7 @@ async fn response_strips_hop_by_hop_headers() {
     // agent's connection to doorman, and must not be relayed through.
     let ca = TestCa::generate();
     let (upstream_addr, _) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "test",
             "SECRET",
@@ -870,7 +873,7 @@ fn spawn_plaintext_mock_upstream_on(listener: TcpListener) -> (SocketAddr, Captu
 #[tokio::test]
 async fn plaintext_upstream_injects_secret_and_skips_tls() {
     let (upstream_addr, captured) = spawn_plaintext_mock_upstream().await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry_full(
             "hass",
             "ha_tok",
@@ -931,7 +934,7 @@ async fn ipv6_loopback_upstream_works_end_to_end() {
     };
     let (upstream_addr, captured) = spawn_plaintext_mock_upstream_on(listener);
 
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry_full(
             "hass6",
             "ha_tok_v6",
@@ -1029,7 +1032,7 @@ async fn pinned_cert_allows_self_signed_upstream() {
     for (k, v) in built.iter() {
         pinned_map.insert(k.clone(), Arc::clone(v));
     }
-    let proxy = spawn_doorman_full(
+    let (proxy, _audit) = spawn_doorman_full(
         entries,
         doorman::proxy::upstream_tls(),
         Arc::new(pinned_map),
@@ -1081,7 +1084,7 @@ async fn pinned_cert_rejects_mismatched_leaf() {
     for (k, v) in built.iter() {
         pinned_map.insert(k.clone(), Arc::clone(v));
     }
-    let proxy = spawn_doorman_full(
+    let (proxy, _audit) = spawn_doorman_full(
         entries,
         doorman::proxy::upstream_tls(),
         Arc::new(pinned_map),
@@ -1230,7 +1233,7 @@ fn ws_request(path: &str, host: &str, cred: &str) -> String {
 async fn websocket_upgrade_relays_splices_and_injects_credential() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_ws_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "wscred",
             "WS_SECRET",
@@ -1291,7 +1294,7 @@ async fn websocket_upgrade_relays_splices_and_injects_credential() {
 async fn websocket_upgrade_to_disallowed_host_is_denied() {
     let ca = TestCa::generate();
     let (upstream_addr, captured) = spawn_ws_mock_upstream(ca.server_config_for("localhost")).await;
-    let proxy = spawn_doorman(
+    let (proxy, _audit) = spawn_doorman(
         vec![entry(
             "wscred",
             "WS_SECRET",
@@ -1320,4 +1323,250 @@ async fn websocket_upgrade_to_disallowed_host_is_denied() {
         captured.lock().unwrap().is_empty(),
         "upstream must not be contacted when the host is denied"
     );
+}
+
+async fn read_audit_lines(path: &std::path::Path, want: usize) -> Vec<serde_json::Value> {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let lines: Vec<serde_json::Value> = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).expect("audit line is valid JSON"))
+                .collect();
+            if lines.len() >= want {
+                return lines;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "audit file {} never reached {} line(s)",
+        path.display(),
+        want
+    );
+}
+
+fn assert_no_secret(path: &std::path::Path) {
+    let raw = std::fs::read_to_string(path).expect("audit file readable");
+    assert!(
+        !raw.contains("SECRET"),
+        "audit line carries the secret: {}",
+        raw
+    );
+}
+
+#[tokio::test]
+async fn audit_denied_request_writes_exactly_one_deny_line() {
+    let ca = TestCa::generate();
+    let (upstream_addr, _captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
+    let (proxy, audit_path) = spawn_doorman(
+        vec![entry(
+            "test",
+            "SECRET",
+            "Authorization",
+            &["allowed.example"],
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, _, _) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/denied/path",
+        vec![("X-Doorman-Cred", "test")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The deny path awaits its audit write before responding, so the line
+    // is on disk the moment the agent sees the 403 (fail-closed).
+    let lines = read_audit_lines(&audit_path, 1).await;
+    assert_eq!(lines.len(), 1, "one line per request, got: {:?}", lines);
+    assert_eq!(lines[0]["decision"], "deny");
+    assert_eq!(lines[0]["reason"], "host not allowlisted for credential");
+    assert_eq!(lines[0]["cred"], "test");
+    assert_eq!(lines[0]["host"], "localhost");
+    assert_eq!(lines[0]["path"], "/denied/path");
+    assert_eq!(lines[0]["status"], 403);
+    assert_no_secret(&audit_path);
+    std::fs::remove_file(&audit_path).ok();
+}
+
+#[tokio::test]
+async fn audit_allowed_request_writes_allow_line_with_status_and_bytes() {
+    let ca = TestCa::generate();
+    let (upstream_addr, _captured) = spawn_mock_upstream(ca.server_config_for("localhost")).await;
+    let (proxy, audit_path) = spawn_doorman(
+        vec![entry(
+            "test",
+            "SECRET",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/ok",
+        vec![("X-Doorman-Cred", "test")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"upstream-ok");
+
+    let lines = read_audit_lines(&audit_path, 1).await;
+    assert_eq!(lines.len(), 1, "one line per request, got: {:?}", lines);
+    assert_eq!(lines[0]["decision"], "allow");
+    assert_eq!(lines[0]["status"], 200);
+    assert_eq!(lines[0]["cred"], "test");
+    assert_eq!(lines[0]["path"], "/ok");
+    assert!(
+        lines[0]["bytes_out"].as_u64().unwrap() > 0,
+        "bytes_out must reflect the streamed body: {:?}",
+        lines[0]
+    );
+    assert_no_secret(&audit_path);
+    std::fs::remove_file(&audit_path).ok();
+}
+
+#[tokio::test]
+async fn deny_dialing_metadata_address_even_when_allowlisted() {
+    // 169.254.0.0/16 is not in the LAN opt-out set, so even a credential
+    // whose allowlist names the metadata IP itself is refused at dial time.
+    // No dial happens, so no network is needed.
+    let ca = TestCa::generate();
+    let (proxy, _audit) = spawn_doorman(
+        vec![entry(
+            "meta",
+            "SECRET",
+            "Authorization",
+            &["169.254.169.254"],
+            &[],
+            8080,
+        )],
+        ca.client_config(),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "169.254.169.254",
+        "/latest/meta-data/",
+        vec![("X-Doorman-Cred", "meta")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("refused: 169.254.169.254 is a link-local/metadata address"),
+        "got: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn lan_entry_may_dial_loopback_resolved_name() {
+    // The opt-out direction that keeps LAN devices (and every test above)
+    // working: hosts: ["localhost"] is a declared LAN device, so dialing
+    // the loopback address its name resolves to stays allowed.
+    let (upstream_addr, _captured) = spawn_plaintext_mock_upstream().await;
+    let (proxy, _audit) = spawn_doorman(
+        vec![entry_full(
+            "lan",
+            "tok",
+            "Authorization",
+            &["localhost"],
+            &[],
+            upstream_addr.port(),
+            false,
+            None,
+        )],
+        doorman::proxy::upstream_tls(),
+    )
+    .await;
+
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "localhost",
+        "/x",
+        vec![("X-Doorman-Cred", "lan")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"plaintext-ok");
+}
+
+#[tokio::test]
+async fn upstream_connect_timeout_denies_502() {
+    // 192.0.2.1 is TEST-NET-1: not routable, packets blackholed (no RST),
+    // and an IP literal — no DNS needed. The dial must expire on
+    // UPSTREAM_CONNECT_TIMEOUT, well under the OS default.
+    let (proxy, audit) = spawn_doorman(
+        vec![entry_full(
+            "blackhole",
+            "SECRET",
+            "Authorization",
+            &["192.0.2.1"],
+            &[],
+            80,
+            false,
+            None,
+        )],
+        doorman::proxy::upstream_tls(),
+    )
+    .await;
+
+    let t0 = std::time::Instant::now();
+    let (status, _, body) = request(
+        proxy,
+        Method::GET,
+        "192.0.2.1",
+        "/x",
+        vec![("X-Doorman-Cred", "blackhole")],
+    )
+    .await;
+    let elapsed = t0.elapsed();
+    let body = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // A network that RSTs 192.0.2.1 yields a fast dial refusal, not an expiry; both are bounded.
+    assert!(
+        body.contains("upstream connect timeout") || body.contains("dial:"),
+        "got: {}",
+        body
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "connect took {:?}; the OS default is not being bounded",
+        elapsed
+    );
+
+    // An unreachable upstream must produce an audit line; the README's 502 claim rests on this.
+    let lines = read_audit_lines(&audit, 1).await;
+    assert_eq!(lines.len(), 1, "one line per request, got: {:?}", lines);
+    assert_eq!(lines[0]["decision"], "deny");
+    assert_eq!(lines[0]["status"], 502);
+    assert_eq!(lines[0]["cred"], "blackhole");
+    assert!(
+        lines[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("upstream:"),
+        "got: {:?}",
+        lines[0]
+    );
+    assert_no_secret(&audit);
+    std::fs::remove_file(&audit).ok();
 }

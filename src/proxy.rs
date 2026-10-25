@@ -35,13 +35,13 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
@@ -70,6 +70,17 @@ const STRIPPED_RESPONSE_HEADERS: &[&str] = &["set-cookie", "www-authenticate"];
 /// Header the agent sets to name the credential it wants doorman to inject.
 /// Doorman strips this header from the request before forwarding upstream.
 const CRED_HEADER: &str = "x-doorman-cred";
+
+/// TCP connect budget for the upstream dial. Without it a credential
+/// pointing at a powered-off LAN box (packets dropped, no RST) blocks for
+/// the OS default (~75s macOS / ~130s Linux): the agent's tool call hangs
+/// and every retry stacks another task and socket.
+pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Budget for sending the request and getting the response head back (a
+/// device that accepts TCP and then never answers). Deliberately does NOT
+/// bound the streaming response body — a large download may take minutes.
+pub const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Server {
@@ -196,7 +207,7 @@ async fn serve(
     // cred header for an allowlisted host would reach `send_upstream` and
     // forward a method doorman was never built to relay.
     if method == hyper::Method::CONNECT {
-        return deny_connect_not_supported(&server, &req, started);
+        return deny_connect_not_supported(&server, &req, started).await;
     }
 
     // Resolve target host: prefer the URI authority (absolute-form requests
@@ -204,7 +215,7 @@ async fn serve(
     let target_host = match resolve_target_host(&req) {
         Some(h) => h,
         None => {
-            return deny_no_target(&server, &method, started);
+            return deny_no_target(&server, &method, started).await;
         }
     };
 
@@ -239,7 +250,8 @@ async fn serve(
                 StatusCode::FORBIDDEN,
                 Some(reason),
                 started,
-            );
+            )
+            .await;
         }
     };
 
@@ -258,7 +270,8 @@ async fn serve(
                 StatusCode::FORBIDDEN,
                 Some("unknown credential"),
                 started,
-            );
+            )
+            .await;
         }
     };
 
@@ -272,7 +285,8 @@ async fn serve(
             StatusCode::FORBIDDEN,
             Some("host not allowlisted for credential"),
             started,
-        );
+        )
+        .await;
     }
     if !entry.method_allowed(method.as_str()) {
         return deny(
@@ -284,7 +298,8 @@ async fn serve(
             StatusCode::FORBIDDEN,
             Some("method not allowlisted for credential"),
             started,
-        );
+        )
+        .await;
     }
 
     // Rewrite headers (shared by the normal and the WebSocket-upgrade paths):
@@ -303,7 +318,8 @@ async fn serve(
     parts.headers.insert(inject_name, inject_value);
     parts.headers.insert(
         HOST,
-        HeaderValue::try_from(host_header_value(&target_host)).expect("host header"),
+        HeaderValue::try_from(host_header_value(&target_host, entry.port, entry.tls))
+            .expect("host header"),
     );
 
     // Force the outgoing URI to origin-form. Upstream HTTP/1.1 origin servers
@@ -320,7 +336,8 @@ async fn serve(
                 StatusCode::BAD_REQUEST,
                 Some("invalid request path"),
                 started,
-            );
+            )
+            .await;
         }
     };
 
@@ -364,7 +381,8 @@ async fn serve(
                 StatusCode::BAD_GATEWAY,
                 Some(&format!("upstream: {}", e)),
                 started,
-            );
+            )
+            .await;
         }
     };
 
@@ -517,7 +535,8 @@ async fn relay_upgrade(
                     StatusCode::BAD_GATEWAY,
                     Some(&format!("upstream: {}", e)),
                     started,
-                );
+                )
+                .await;
             }
         };
 
@@ -565,7 +584,7 @@ async fn relay_upgrade(
                 // handshake that fails to complete after the 101.
                 let rec =
                     incomplete_upgrade_record(&cred_name, &target_host, &method, &path, started);
-                if let Err(e) = audit.write(&rec) {
+                if let Err(e) = audit.write(&rec).await {
                     eprintln!("audit write failed for incomplete websocket upgrade: {}", e);
                 }
                 return;
@@ -597,7 +616,7 @@ async fn relay_upgrade(
             reason: None,
             protocol: Some("websocket"),
         };
-        if let Err(e) = audit.write(&rec) {
+        if let Err(e) = audit.write(&rec).await {
             eprintln!("audit write failed for websocket relay: {}", e);
         }
     });
@@ -736,13 +755,24 @@ fn strip_v6_brackets(host: &str) -> &str {
 /// Format a host for the outgoing `Host` header. RFC 7230 requires an IPv6
 /// literal to be wrapped in `[...]` there — unlike in config or in the
 /// internal comparisons this module does throughout, which use the bare
-/// canonical form. Anything else passes through unchanged.
-fn host_header_value(host: &str) -> String {
-    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+/// canonical form — and requires a non-default port to be included
+/// (`Host: host:8443`). Dropping the port made host-filtering servers
+/// (ASP.NET Core host filtering, vhosts listing `example.com:8443`) see a
+/// mismatch and serve their default site or 421. Anything else passes
+/// through unchanged.
+fn host_header_value(host: &str, port: u16, tls: bool) -> String {
+    let mut s = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{}]", host)
     } else {
         host.to_string()
+    };
+    // Bracket first, then append the port — never bracket a `host:port`.
+    let default_port = if tls { 443 } else { 80 };
+    if port != default_port {
+        s.push(':');
+        s.push_str(&port.to_string());
     }
+    s
 }
 
 /// Look up the agent's credential selection — the `X-Doorman-Cred` header.
@@ -774,14 +804,29 @@ where
     B::Data: Send,
     B::Error: Into<DynErr>,
 {
-    // Dial via the (host, port) tuple form rather than formatting a single
-    // "host:port" string: for a bare IPv6 literal like `fd00::5`, string
-    // concatenation would produce ambiguous colon soup ("fd00::5:8123").
-    // Rust's resolver accepts a bare (unbracketed) IPv4/IPv6/hostname string
-    // as the host half of this tuple directly.
-    let tcp = TcpStream::connect((target_host, entry.port))
+    // Resolve first, classify, then dial a validated address — so the
+    // security check below and the connection cannot disagree (a second,
+    // unvalidated resolution at connect time would be a TOCTOU via DNS
+    // rebinding).
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((target_host, entry.port))
         .await
-        .map_err(|e| format!("dial {}:{}: {}", target_host, entry.port, e))?;
+        .map_err(|e| format!("resolve {}:{}: {}", target_host, entry.port, e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("no address for {}:{}", target_host, entry.port));
+    }
+    // The host allowlist binds a NAME, not an address: an allowlisted name
+    // whose DNS answers 169.254.169.254 (cloud metadata) or 127.0.0.1 (a
+    // local admin UI) would otherwise get the real Authorization header.
+    // An entry whose own hosts list names a loopback/private/ULA address is
+    // a declared LAN device — for those the operator has opted in and
+    // everything stays dialable. The whole dial (guard + connect across all
+    // resolved addresses, in resolver order as `TcpStream::connect((host,
+    // port))` used to try them) runs inside UPSTREAM_CONNECT_TIMEOUT.
+    let lan = entry_declares_lan(&entry.hosts);
+    let tcp = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, dial_first_allowed(&addrs, lan))
+        .await
+        .map_err(|_| "upstream connect timeout".to_string())??;
 
     // Two transport paths. `entry.tls = true` is the historical case —
     // doorman wraps the TCP stream in TLS using either webpki roots or
@@ -803,10 +848,7 @@ where
             tokio::spawn(async move {
                 let _ = conn.with_upgrades().await;
             });
-            sender
-                .send_request(req)
-                .await
-                .map_err(|e| format!("send: {}", e))
+            send_with_head_timeout(&mut sender, req).await
         }
         None => {
             let (mut sender, conn) = client_http1::handshake(TokioIo::new(tcp))
@@ -815,17 +857,113 @@ where
             tokio::spawn(async move {
                 let _ = conn.with_upgrades().await;
             });
-            sender
-                .send_request(req)
-                .await
-                .map_err(|e| format!("send: {}", e))
+            send_with_head_timeout(&mut sender, req).await
         }
     }
 }
 
+/// Dial the first resolved address that passes the link-local/metadata
+/// guard, trying each in resolver order (what
+/// `TcpStream::connect((host, port))` did before resolve-then-validate).
+/// If every address is refused by the guard, the refusal is the error; if
+/// a dialable address fails to connect, the last connect error is.
+async fn dial_first_allowed(addrs: &[SocketAddr], lan_opt_out: bool) -> Result<TcpStream, String> {
+    let mut refused: Option<IpAddr> = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        if is_link_local_or_metadata(addr.ip()) && !lan_opt_out {
+            if refused.is_none() {
+                refused = Some(addr.ip());
+            }
+            continue;
+        }
+        match TcpStream::connect(addr).await {
+            Ok(t) => return Ok(t),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(ip) = refused {
+        return Err(format!("refused: {} is a link-local/metadata address", ip));
+    }
+    Err(format!(
+        "dial: {}",
+        last_err.map_or_else(|| "no address".to_string(), |e| e.to_string())
+    ))
+}
+
+/// send_request bounded by UPSTREAM_RESPONSE_HEAD_TIMEOUT: covers sending
+/// the request and receiving the response head, nothing more — the body
+/// stream returned here stays unbounded.
+async fn send_with_head_timeout<B>(
+    sender: &mut client_http1::SendRequest<B>,
+    req: Request<B>,
+) -> Result<Response<Incoming>, String>
+where
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<DynErr>,
+{
+    match tokio::time::timeout(UPSTREAM_RESPONSE_HEAD_TIMEOUT, sender.send_request(req)).await {
+        Err(_) => Err("upstream response timeout".to_string()),
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Err(format!("send: {}", e)),
+    }
+}
+
+/// Addresses doorman refuses to dial: cloud metadata (169.254.0.0/16),
+/// CGNAT (100.64.0.0/10, used by some metadata/relay services), IPv6
+/// link-local (fe80::/10), and the unspecified address (which means
+/// "this host" on v4 and "any" on v6). Not private/ULA ranges — those
+/// are the declared-LAN case, see [`entry_declares_lan`].
+fn is_link_local_or_metadata(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 169 && o[1] == 254 // 169.254.0.0/16 link-local + metadata
+                || (o[0] == 100 && o[1] & 0xc0 == 64) // 100.64.0.0/10 CGNAT
+                || o == [0, 0, 0, 0] // unspecified
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || seg == [0; 8] // :: unspecified
+        }
+    }
+}
+
+/// True when the entry's own `hosts:` list contains a loopback/private/
+/// unique-local address (or `localhost`). Such an entry is a declared LAN
+/// device — the operator has explicitly pointed the credential at private
+/// space, so the link-local/metadata dial guard does not apply to it.
+fn entry_declares_lan(hosts: &[String]) -> bool {
+    hosts.iter().any(|h| {
+        // Config hosts are canonicalized: lowercase, bare IPv6 (no
+        // brackets), so a plain lowercase compare is enough for localhost.
+        if h == "localhost" {
+            return true;
+        }
+        match h.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => {
+                let o = v4.octets();
+                o[0] == 127 // 127.0.0.0/8
+                    || o[0] == 10
+                    || (o[0] == 172 && o[1] & 0xf0 == 16) // 172.16.0.0/12
+                    || (o[0] == 192 && o[1] == 168) // 192.168.0.0/16
+            }
+            Ok(IpAddr::V6(v6)) => {
+                let seg = v6.segments();
+                v6.is_loopback() // ::1
+                    || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                    || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+            }
+            Err(_) => false, // plain hostname: no LAN opt-out implied
+        }
+    })
+}
+
 /// Special-case deny for "we couldn't even figure out where this request was
 /// going" — neither absolute-form URI nor Host header.
-fn deny_no_target(
+async fn deny_no_target(
     server: &Server,
     method: &hyper::Method,
     started: Instant,
@@ -840,12 +978,13 @@ fn deny_no_target(
         Some("no target host (need absolute-form URI or Host header)"),
         started,
     )
+    .await
 }
 
 /// Special-case deny for a CONNECT request. Doorman never tunnels, so this is
 /// always a deterministic 405 naming the fix rather than whatever confusing
 /// status the request would otherwise bottom out at.
-fn deny_connect_not_supported(
+async fn deny_connect_not_supported(
     server: &Server,
     req: &Request<Incoming>,
     started: Instant,
@@ -864,10 +1003,11 @@ fn deny_connect_not_supported(
         ),
         started,
     )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn deny(
+async fn deny(
     server: &Server,
     target_host: &str,
     method: &str,
@@ -895,7 +1035,7 @@ fn deny(
         reason,
         protocol: None,
     };
-    if let Err(e) = server.audit.write(&rec) {
+    if let Err(e) = server.audit.write(&rec).await {
         return fail_closed_audit(e);
     }
 
@@ -1111,24 +1251,61 @@ struct AuditCtx {
     bytes_out: Arc<AtomicU64>,
 }
 
+/// The end-of-stream allow line for a proxied response. Owns its context so
+/// it can be spawned from the (sync) body-end callback.
+async fn write_ctx_audit(ctx: AuditCtx) {
+    let rec = Record {
+        ts: audit::now_rfc3339(),
+        cred: Some(&ctx.cred),
+        host: &ctx.host,
+        method: &ctx.method,
+        path: &ctx.path,
+        status: ctx.status,
+        bytes_in: ctx.bytes_in.load(Ordering::Relaxed),
+        bytes_out: ctx.bytes_out.load(Ordering::Relaxed),
+        ms: ctx.started.elapsed().as_millis() as u64,
+        decision: "allow",
+        reason: None,
+        protocol: None,
+    };
+    if let Err(e) = ctx.audit.write(&rec).await {
+        eprintln!("audit write failed mid-stream: {}", e);
+    }
+}
+
 fn build_audit_callback(ctx: AuditCtx) -> Box<dyn FnOnce() + Send + Sync> {
     Box::new(move || {
-        let rec = Record {
-            ts: audit::now_rfc3339(),
-            cred: Some(&ctx.cred),
-            host: &ctx.host,
-            method: &ctx.method,
-            path: &ctx.path,
-            status: ctx.status,
-            bytes_in: ctx.bytes_in.load(Ordering::Relaxed),
-            bytes_out: ctx.bytes_out.load(Ordering::Relaxed),
-            ms: ctx.started.elapsed().as_millis() as u64,
-            decision: "allow",
-            reason: None,
-            protocol: None,
-        };
-        if let Err(e) = ctx.audit.write(&rec) {
-            eprintln!("audit write failed mid-stream: {}", e);
+        // The write+fsync is async now, but this callback fires from a
+        // sync body context (poll_frame end-of-stream, or Drop) that
+        // cannot await — hand it to a spawned task. Best-effort like the
+        // old inline write: the response has already been streamed, only
+        // the audit line remains.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(write_ctx_audit(ctx));
+            }
+            // Body dropped after runtime shutdown: no executor left to
+            // spawn onto, fall back to the sync write (blocking is
+            // harmless — the runtime is gone).
+            Err(_) => {
+                let rec = Record {
+                    ts: audit::now_rfc3339(),
+                    cred: Some(&ctx.cred),
+                    host: &ctx.host,
+                    method: &ctx.method,
+                    path: &ctx.path,
+                    status: ctx.status,
+                    bytes_in: ctx.bytes_in.load(Ordering::Relaxed),
+                    bytes_out: ctx.bytes_out.load(Ordering::Relaxed),
+                    ms: ctx.started.elapsed().as_millis() as u64,
+                    decision: "allow",
+                    reason: None,
+                    protocol: None,
+                };
+                if let Err(e) = ctx.audit.write_blocking(&rec) {
+                    eprintln!("audit write failed mid-stream: {}", e);
+                }
+            }
         }
     })
 }
@@ -1161,10 +1338,89 @@ mod tests {
 
     #[test]
     fn host_header_value_brackets_only_ipv6() {
-        assert_eq!(host_header_value("fd00::5"), "[fd00::5]");
-        assert_eq!(host_header_value("::1"), "[::1]");
-        assert_eq!(host_header_value("192.168.1.1"), "192.168.1.1");
-        assert_eq!(host_header_value("api.github.com"), "api.github.com");
+        // Default ports (443 TLS, 80 plain) stay bare; everything else
+        // carries `:port` per RFC 7230 (finding: host-filtering servers).
+        assert_eq!(host_header_value("fd00::5", 443, true), "[fd00::5]");
+        assert_eq!(host_header_value("::1", 443, true), "[::1]");
+        assert_eq!(host_header_value("192.168.1.1", 443, true), "192.168.1.1");
+        assert_eq!(
+            host_header_value("api.github.com", 443, true),
+            "api.github.com"
+        );
+    }
+
+    #[test]
+    fn host_header_value_appends_non_default_port() {
+        assert_eq!(
+            host_header_value("192.168.86.188", 8123, false),
+            "192.168.86.188:8123"
+        );
+        assert_eq!(
+            host_header_value("example.com", 8443, true),
+            "example.com:8443"
+        );
+        // Plain HTTP on its default port stays bare too.
+        assert_eq!(host_header_value("lan.local", 80, false), "lan.local");
+        // TLS endpoint reached on a non-TLS default port keeps the port.
+        assert_eq!(
+            host_header_value("api.example.com", 443, false),
+            "api.example.com:443"
+        );
+    }
+
+    #[test]
+    fn host_header_value_brackets_ipv6_before_appending_port() {
+        // The port goes OUTSIDE the brackets, and the brackets go around
+        // the bare host only — never around `host:port`.
+        assert_eq!(host_header_value("fd00::5", 8123, false), "[fd00::5]:8123");
+        assert_eq!(host_header_value("::1", 8123, false), "[::1]:8123");
+    }
+
+    #[test]
+    fn link_local_or_metadata_classification() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Cloud metadata and link-local: refused.
+        assert!(is_link_local_or_metadata(ip("169.254.169.254")));
+        assert!(is_link_local_or_metadata(ip("169.254.1.1")));
+        // CGNAT range: refused.
+        assert!(is_link_local_or_metadata(ip("100.64.0.1")));
+        assert!(is_link_local_or_metadata(ip("100.127.255.255")));
+        assert!(!is_link_local_or_metadata(ip("100.128.0.0")));
+        assert!(!is_link_local_or_metadata(ip("100.63.255.255")));
+        // IPv6 link-local fe80::/10: refused; site-local-ish fec0::/10 is not.
+        assert!(is_link_local_or_metadata(ip("fe80::1")));
+        assert!(is_link_local_or_metadata(ip("febf::ffff")));
+        assert!(!is_link_local_or_metadata(ip("fec0::1")));
+        // Unspecified: refused.
+        assert!(is_link_local_or_metadata(ip("0.0.0.0")));
+        assert!(is_link_local_or_metadata(ip("::")));
+        // Loopback, private, ULA, public: not in this deny set (the LAN
+        // opt-out in entry_declares_lan decides those).
+        assert!(!is_link_local_or_metadata(ip("127.0.0.1")));
+        assert!(!is_link_local_or_metadata(ip("::1")));
+        assert!(!is_link_local_or_metadata(ip("10.0.0.5")));
+        assert!(!is_link_local_or_metadata(ip("192.168.86.188")));
+        assert!(!is_link_local_or_metadata(ip("fd00::5")));
+        assert!(!is_link_local_or_metadata(ip("8.8.8.8")));
+    }
+
+    #[test]
+    fn entry_declares_lan_optout() {
+        let hosts = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // The existing integration tests dial 127.0.0.1 / ::1 through
+        // entries whose hosts list loopback — this is what protects them.
+        assert!(entry_declares_lan(&hosts(&["localhost"])));
+        assert!(entry_declares_lan(&hosts(&["::1"])));
+        assert!(entry_declares_lan(&hosts(&["127.0.0.1"])));
+        assert!(entry_declares_lan(&hosts(&["10.0.0.7"])));
+        assert!(entry_declares_lan(&hosts(&["172.16.5.4"])));
+        assert!(!entry_declares_lan(&hosts(&["172.32.0.1"])));
+        assert!(entry_declares_lan(&hosts(&["192.168.86.188"])));
+        assert!(entry_declares_lan(&hosts(&["fd00::5"])));
+        assert!(entry_declares_lan(&hosts(&["fe80::2ab"])));
+        // Public names/addresses imply no LAN opt-out.
+        assert!(!entry_declares_lan(&hosts(&["api.github.com"])));
+        assert!(!entry_declares_lan(&hosts(&["8.8.8.8", "169.254.169.254"])));
     }
 
     #[test]

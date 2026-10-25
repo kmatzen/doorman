@@ -688,6 +688,22 @@ fn cmd_list(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Loud one-shot warning when the unauthenticated proxy binds beyond loopback; pure so it is testable without binding a socket.
+fn non_loopback_listen_warning(listen: SocketAddr) -> Option<String> {
+    if listen.ip().is_loopback() {
+        return None;
+    }
+    Some(format!(
+        "SECURITY: --listen {} is not a loopback address, and the proxy has NO\n  \
+         caller authentication.\n  \
+         Every host that can reach this address can use every credential doorman holds —\n  \
+         binding here hands your API keys to the whole LAN (on 0.0.0.0, to the world).\n  \
+         Pin the listener to 127.0.0.1, or front it with firewalled, authenticated\n  \
+         access you control.",
+        listen
+    ))
+}
+
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG);
     let mut audit_path = PathBuf::from(DEFAULT_AUDIT);
@@ -747,6 +763,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         if let Some(warning) = hardening::login_uid_warning(hardening::current_euid()) {
             eprintln!("doormand: {}", warning);
         }
+    }
+
+    // The network-side twin of the uid posture warning; loopback stays silent.
+    if let Some(warning) = non_loopback_listen_warning(listen) {
+        eprintln!("doormand: {}", warning);
     }
 
     let upstream_tls = proxy::upstream_tls();
@@ -855,6 +876,24 @@ fn audit_loaded_config(audit: &audit::Audit, config_path: &std::path::Path, cfg:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_listens_get_no_security_warning() {
+        // The default posture stays silent: both loopback families, any port.
+        assert!(non_loopback_listen_warning("127.0.0.1:18443".parse().unwrap()).is_none());
+        assert!(non_loopback_listen_warning("127.5.5.5:1".parse().unwrap()).is_none());
+        assert!(non_loopback_listen_warning("[::1]:18443".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn non_loopback_listens_warn() {
+        for addr in ["0.0.0.0:18443", "[::]:18443", "192.168.86.10:18443"] {
+            let w = non_loopback_listen_warning(addr.parse().unwrap())
+                .unwrap_or_else(|| panic!("{addr} should warn"));
+            assert!(w.contains("SECURITY"), "got: {}", w);
+            assert!(w.contains(addr), "warning should name the address: {}", w);
+        }
+    }
 
     #[test]
     fn fingerprint_target_bare_host_no_port() {

@@ -49,3 +49,7 @@
   inject: "X-API-KEY: {}"
   hosts: [fd00::5]
   port: 8443
+  # TLS defaults to on, so without a pin the self-signed leaf is checked against
+  # public roots and every request fails "UnknownIssuer". Pin with the bracketed
+  # form above: doormand fingerprint '[fd00::5]:8443'
+  tls_pinned_sha256: REPLACE_WITH_64_HEX_CHARS_FROM_FINGERPRINT
