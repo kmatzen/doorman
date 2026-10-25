@@ -5,6 +5,9 @@
 
 An HTTP proxy that holds your API keys and refuses to send them anywhere they don't belong.
 
+> [!IMPORTANT]
+> **Project status: deprecated for new deployments and in maintenance mode.** Doorman remains supported for existing deployments and will continue to receive critical security and compatibility fixes. For new deployments that need broader agent isolation, filesystem controls, or per-command policies, use [nono](https://github.com/nolabs-ai/nono). Nono is not a drop-in replacement: review the [migration guide](MIGRATION.md), pin the version you test, and keep doorman until your required behavior has passed the documented cutover checks. No doorman end-of-life date has been set.
+
 The agent process never sees the secret value. It names the credential it wants on each request (`X-Doorman-Cred: github`); doorman validates the destination against a per-credential allowlist, sets the auth header on the outgoing request, forwards it, and writes one audit-log line. If the agent tries to send a GitHub token to `attacker.com`, doorman returns 403 and the secret stays where it is.
 
 ## How it works
@@ -191,6 +194,8 @@ doormand run \
 
 `--insecure-skip-mode-check` lets you use a config file that isn't mode 0400. Don't use it in production.
 
+`--listen <addr>:<port>` binds somewhere other than `127.0.0.1:18443`. On a **non-loopback** address `run` prints a `SECURITY` warning at startup and keeps going: every host that can reach that socket can spend your credentials ([Threat model](#out-of-scope) item 5). Bind to loopback unless you have fenced the network off on purpose.
+
 | flag | what it does | intended use | if omitted |
 | --- | --- | --- | --- |
 | `--insecure-skip-mode-check` | Allows a config whose mode is not exactly 0400. It does not provide any other isolation. | Local development only, for a checkout-owned config. Never set it in a production service. | A loosely permissioned config is rejected at startup, before secrets are loaded. |
@@ -209,7 +214,7 @@ On macOS, substitute `_doorman:_doorman` and use the system LaunchDaemon install
 
 ### Validate a config before restarting
 
-`validate-config` runs the full config validation — YAML syntax, the `inject` template shape, host/method allowlists, the `tls`/`tls_pinned_sha256` consistency rules, and the mode-0400 gate — without binding the proxy port, opening the audit log, or contacting any upstream. Run it before restarting a live daemon so a typo fails here instead of taking the proxy down:
+`validate-config` runs the full config validation — YAML syntax, the `inject` template shape, host/method allowlists, the `tls`/`tls_pinned_sha256` consistency rules, the rendered-header check, and the mode-0400 gate — without binding the proxy port, opening the audit log, or contacting any upstream. The header check renders each credential's `inject` template and requires the result to be a valid single-line HTTP header value, so a key pasted with a trailing newline fails here instead of crashing the daemon on its first request. Run it before restarting a live daemon so a typo fails here instead of taking the proxy down:
 
 ```
 doormand validate-config --config /etc/doorman/doorman.yaml
@@ -400,7 +405,7 @@ One JSON line per request, fsync'd. Default path `/var/log/doorman/audit.log`, m
 | `bytes_out` | response body bytes returned |
 | `ms` | total latency, accept to last byte |
 | `decision` | `"allow"` or `"deny"` |
-| `reason` | denial reason on a deny; on an `"allow"` it's normally omitted, except for the one case where doorman already answered 101 to a WebSocket upgrade but the connection failed to complete before any bytes were spliced — there it explains why `bytes_in`/`bytes_out` are 0 despite the credential having reached the upstream |
+| `reason` | denial reason on a deny; on an `"allow"` it's normally omitted, except for the one case where doorman already answered 101 to a WebSocket upgrade but the connection failed to complete before any bytes were spliced — there it explains why `bytes_in`/`bytes_out` are 0 despite the credential having reached the upstream. An upstream doorman couldn't reach is a 502 with `"reason":"upstream connect timeout"` or `"upstream response timeout"` |
 | `protocol` | `"websocket"` for a spliced Upgrade relay; omitted for normal request/response |
 
 No bodies, no headers, no secrets.
@@ -444,6 +449,30 @@ Doorman is for the case where an LLM agent generates network calls during tool u
 
 Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the file your agent reads as system instructions (`CLAUDE.md` for Claude Code, `.cursorrules` for Cursor, an `--read` file for Aider). It tells the agent which credentials doorman holds and how to invoke them via the proxy. The agent uses doorman when it needs one of those credentials, and calls the network directly otherwise.
 
+### MCP server and pi extension
+
+For agents that speak [MCP](https://modelcontextprotocol.io), `share/mcp/doorman-mcp.mjs` is a dependency-free stdio MCP server with two tools:
+
+- `doorman_credentials` — credential names with their allowed hosts and methods (never secrets)
+- `doorman_request` — issues a request through the proxy with the right headers, so the agent can't get the curl plumbing wrong
+
+Its only policy source is `doormand inspect --json` (doorman >= 0.1.11) — always fresh, no secrets. Since the live config is 0400 and owned by the doorman uid, give the agent's uid passwordless sudo for just that command:
+
+```
+# /etc/sudoers.d/doorman-inspect (via visudo)
+<user> ALL=(root) NOPASSWD: /opt/homebrew/bin/doormand inspect --json
+```
+
+then set `DOORMAN_INSPECT_SUDO=1` in the environment the MCP server runs in (the pi extension in `share/pi/doorman.ts` forwards it). There is no second policy source: on a doorman with no `inspect`, the server has nothing to read — upgrade it.
+
+Register it in your agent's MCP config (e.g. pi's `mcp.json`):
+
+```json
+{ "mcpServers": { "doorman": { "command": "node", "args": ["/path/to/share/mcp/doorman-mcp.mjs"] } } }
+```
+
+`share/pi/doorman.ts` is a [pi extension](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md) that registers the server for you and appends the usage rules to the system prompt. Symlink it into `~/.pi/agent/extensions/` (it finds the MCP script relative to itself, falling back to `~/git/doorman`).
+
 ## Threat model
 
 **The adversary is the agent process itself.** Doorman assumes the agent may be compromised, prompt-injected, or buggy: it can issue any HTTP request, name any credential, parse any response. Doorman's job is to make sure that adversary cannot exfiltrate a secret it never directly sees.
@@ -453,10 +482,10 @@ Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the
 ### In scope
 
 1. **Secret confidentiality from the agent.** The agent's process never holds the secret in memory, env, filesystem, or any response from doorman. It names credentials by label only.
-2. **Destination binding.** A secret is only ever sent to a host (and optionally method) explicitly allowlisted for it. Host comes from the request URI authority or `Host` header, lowercased, and exact-matched against the allowlist. Redirects are not followed; 3xx responses are returned to the agent verbatim.
+2. **Destination binding.** A secret is only ever sent to a host (and optionally method) explicitly allowlisted for it. Host comes from the request URI authority or `Host` header, lowercased, and exact-matched against the allowlist. Redirects are not followed; 3xx responses are returned to the agent verbatim. The allowlist binds a *name*, not an address — DNS is resolved at dial time. As a backstop, doorman resolves the target and refuses link-local, metadata and CGNAT addresses (`169.254.0.0/16`, `100.64.0.0/10`, `fe80::/10`, and the unspecified address) for any credential whose `hosts` list contains no loopback/private/unique-local address; a credential that declares a LAN address in `hosts:` is treated as a declared LAN device and is exempt.
 3. **Non-repudiation.** Every request — allow or deny — produces an audit-log line, fsync'd. Denies are logged before the response is sent; allows are logged at end-of-stream.
 4. **Process isolation.** With the systemd unit, doorman runs under a different uid from the agent, with `NoNewPrivileges`, no ambient capabilities, and `PR_SET_DUMPABLE=0` (no core dumps, no ptrace from same-uid processes).
-5. **Config confidentiality at rest — between *uids*.** The config file is mode 0400, owned by the doorman uid; doorman refuses to start otherwise (unless `--insecure-skip-mode-check`). This keeps the secrets away from *other* users and from group/world, but 0400 is only advisory against the *owning* uid — that uid can read the file and can `chmod` it writable. The boundary is therefore only as strong as the separation between doorman's uid and the agent's: real isolation requires running doorman under a **dedicated** uid the agent never runs as (the systemd unit's `User=doorman`, or `_doorman` from `install-darwin.sh`). The convenience brew install, which runs doorman as your own uid, provides **no** isolation from other code running as you — see [Homebrew](#homebrew-macos--linux). To keep this from being a silent trap, `doormand run` prints a prominent warning at startup whenever it detects it is running under a personal login uid (rather than a dedicated service account); pass `--allow-same-uid` to acknowledge and silence it once you've made an informed choice. A config-load line in the audit log fingerprints the file at each start so out-of-band edits are detectable.
+5. **Config confidentiality at rest — between *uids*.** The config file is mode 0400, owned by the doorman uid; doorman refuses to start otherwise (unless `--insecure-skip-mode-check`). This keeps the secrets away from *other* users and from group/world, but 0400 is only advisory against the *owning* uid — that uid can read the file and can `chmod` it writable. The boundary is therefore only as strong as the separation between doorman's uid and the agent's: real isolation requires running doorman under a **dedicated** uid the agent never runs as (the systemd unit's `User=doorman`, or `_doorman` from `install-darwin.sh`). The convenience brew install, which runs doorman as your own uid, provides **no** isolation from other code running as you — see [Homebrew](#homebrew-macos--linux). To keep this from being a silent trap, `doormand run` prints a prominent warning at startup whenever it detects it is running under a personal login uid (rather than a dedicated service account); pass `--allow-same-uid` to acknowledge and silence it once you've made an informed choice. The bind address gets the same treatment: `doormand run --listen` on a non-loopback address prints a `SECURITY` warning, because once the socket is off loopback the agent uid is no longer the only thing that can reach it. A config-load line in the audit log fingerprints the file at each start so out-of-band edits are detectable.
 
 ### Out of scope
 
@@ -465,7 +494,7 @@ Drop [`examples/agent-instructions.md`](examples/agent-instructions.md) into the
 3. **Host compromise.** Kernel exploits, root, ptrace from a privileged uid, or a tampered doorman binary defeat everything. Verify release artifacts before installing.
 4. **Allowlist enumeration.** The agent can probe credential/host pairs and observe allow/deny. Treat the allowlist itself as non-secret.
 5. **Co-tenant processes.** Any process that can reach doorman's listening socket can issue requests as the agent. Pin the listener to loopback (default) and ensure only the agent uid can reach it.
-6. **Network adversaries past doorman.** Doorman validates upstream TLS against Mozilla's `webpki-roots`, statically linked at build time. It does not pin certificates and does not consult the system trust store.
+6. **Network adversaries past doorman.** Doorman validates upstream TLS against Mozilla's `webpki-roots`, statically linked at build time. It does not pin certificates and does not consult the system trust store. And an allowlisted DNS name is only a *name*: resolution happens at dial time, so whoever controls that zone — authoritative server, resolver, or the record's owner, more so with short TTLs and public DNS — can steer the key to an address of their choosing. The [SSRF backstop](#in-scope) blocks the metadata/link-local/CGNAT ranges; it cannot stop a name moving to another routable public IP. For anything sensitive, prefer an IP literal in `hosts:` (with a pin on TLS), not a name.
 7. **Side channels.** Timing, response-size, and audit-volume side channels are not mitigated.
 
 ### macOS deployments
@@ -480,6 +509,7 @@ macOS's hardening primitives are weaker than systemd's. The `_doorman` user prov
 - **Upstream port comes from the credential's `port` field**, not the agent's URI. Defaults to 443.
 - **HTTP/1.1 only**, both sides. No HTTP/2.
 - **No upstream connection pooling.** One TLS handshake per upstream request, ~50ms cost.
+- **Upstream timeouts are fixed.** 3s to connect, 60s for the response head; the response body is not bounded. A timeout is a 502 with reason `upstream connect timeout` / `upstream response timeout`, in the response body and the audit line.
 - **Reload is signal-based.** Send `SIGHUP` after changing the config. Invalid replacements are rejected while the previous policy remains active; use `doormand validate-config` first for immediate operator feedback.
 - **`install-service` doesn't install.** It prints; you redirect.
 
@@ -496,13 +526,16 @@ macOS's hardening primitives are weaker than systemd's. The `_doorman` user prov
 | `deny_disallowed_method` | Credential used with a method outside its allowlist → 403. |
 | `deny_missing_cred_header` / `deny_multiple_cred_headers` | Zero or multiple `X-Doorman-Cred` headers → 403. |
 | `response_strips_set_cookie_and_www_authenticate` | Sensitive response headers are stripped before reaching the agent. |
+| audit-trail tests (`tests/integration.rs`) | Every request — allow, deny, and upstream-failure 502 — appends exactly one audit line, and the line carries no secret. |
+| config-validation tests (`src/config.rs`) | A secret that can't form a valid single-line header value (e.g. trailing newline) fails `validate-config` and startup instead of the first request. |
+| `deny_dialing_metadata_address_even_when_allowlisted` | An allowlisted name resolving to `169.254.169.254` is refused, not dialed. |
 
 CI runs the full suite on Linux and macOS, with `clippy -D warnings`, on every push and PR. A separate audit workflow checks dependencies against the RustSec advisory DB on every Cargo manifest change and once a day on cron.
 
 ## Layout
 
 ```
-src/main.rs       CLI dispatch (install-service / run / validate-config / fingerprint)
+src/main.rs       CLI dispatch (install-service / run / validate-config / inspect / fingerprint)
 src/config.rs     YAML loader
 src/audit.rs      JSON-line audit writer, fsync per record
 src/proxy.rs      HTTP/1.1 server, header rewrite, upstream TLS, body streaming
