@@ -11,6 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rcgen::{CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, SanType};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+
 fn doormand() -> Command {
     Command::new(env!("CARGO_BIN_EXE_doormand"))
 }
@@ -305,7 +312,10 @@ fn list_queries_health_endpoint_and_prints_names_or_json() {
 /// CI runner misses the diagnostics, too long and every test run pays for
 /// the worst case. Stops as soon as the posture-warning or "listening" line
 /// appears (whichever comes first), or the deadline passes.
-fn run_and_capture_stderr(config: &std::path::Path, extra: &[&str]) -> String {
+fn run_and_capture_stderr(
+    config: &std::path::Path,
+    extra: &[&str],
+) -> (String, std::path::PathBuf) {
     static N: AtomicU64 = AtomicU64::new(0);
     let i = N.fetch_add(1, Ordering::Relaxed);
     let audit =
@@ -354,14 +364,23 @@ fn run_and_capture_stderr(config: &std::path::Path, extra: &[&str]) -> String {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let _ = child.kill();
-    // Drain anything already buffered before the process actually dies.
+    // SIGTERM, not child.kill() (SIGKILL): the graceful path is what prints the shutdown line and flushes the audit record.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < exit_deadline {
+        if let Ok(s) = rx.recv_timeout(Duration::from_millis(100)) {
+            captured = s;
+        }
+        if child.try_wait().map(|s| s.is_some()).unwrap_or(true) {
+            break;
+        }
+    }
+    let _ = child.wait();
     while let Ok(s) = rx.recv_timeout(Duration::from_millis(50)) {
         captured = s;
     }
-    let _ = child.wait();
-    std::fs::remove_file(&audit).ok();
-    captured
+    // Audit file is returned, not deleted: callers read it, then remove it.
+    (captured, audit)
 }
 
 #[test]
@@ -380,14 +399,16 @@ fn run_warns_about_same_uid_exposure_and_flag_silences_it() {
     );
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-    let warned = run_and_capture_stderr(&p, &[]);
+    let (warned, warned_audit) = run_and_capture_stderr(&p, &[]);
+    std::fs::remove_file(&warned_audit).ok();
     assert!(
         warned.contains("SECURITY") && warned.contains("issues/39"),
         "expected a same-UID posture warning, got: {}",
         warned
     );
 
-    let silenced = run_and_capture_stderr(&p, &["--allow-same-uid"]);
+    let (silenced, silenced_audit) = run_and_capture_stderr(&p, &["--allow-same-uid"]);
+    std::fs::remove_file(&silenced_audit).ok();
     assert!(
         !silenced.contains("SECURITY"),
         "--allow-same-uid should suppress the warning, got: {}",
@@ -516,4 +537,346 @@ fn sighup_reloads_valid_config_and_keeps_previous_policy_on_invalid_config() {
     let _ = child.wait();
     std::fs::remove_file(&config).ok();
     std::fs::remove_file(&audit).ok();
+}
+
+#[test]
+fn validate_config_uses_singular_wording_for_one_credential() {
+    let p = write_tmp(
+        "single",
+        "- name: github\n  secret: ghp_x\n  inject: 'Authorization: Bearer {}'\n  hosts: [api.github.com]\n",
+    );
+    let out = doormand()
+        .args(["validate-config", "--config"])
+        .arg(&p)
+        .arg("--insecure-skip-mode-check")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 credential)"),
+        "expected singular wording, stdout: {}",
+        stdout
+    );
+    std::fs::remove_file(&p).ok();
+}
+
+#[test]
+fn run_binds_writes_audit_config_load_and_shuts_down_on_sigterm() {
+    // Exercises `cmd_run`'s success path end to end — independent of euid,
+    // unlike the posture-warning test above — including the best-effort
+    // config_load audit record and the graceful SIGTERM branch.
+    let p = write_tmp(
+        "run_happy",
+        "- name: github\n  secret: ghp_x\n  inject: 'Authorization: Bearer {}'\n  hosts: [api.github.com]\n",
+    );
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+    let (stderr, audit_path) = run_and_capture_stderr(&p, &["--allow-same-uid"]);
+    assert!(
+        stderr.contains("listening on") && stderr.contains("SIGTERM, shutting down"),
+        "expected a clean startup and graceful shutdown, got: {}",
+        stderr
+    );
+
+    let audit_contents = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        audit_contents.contains("config_load") && audit_contents.contains("github"),
+        "expected a config_load audit record naming the credential, got: {}",
+        audit_contents
+    );
+    std::fs::remove_file(&audit_path).ok();
+    std::fs::remove_file(&p).ok();
+}
+
+#[test]
+fn install_service_rejects_unknown_flag() {
+    let out = doormand()
+        .args(["install-service", "--nope"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag"), "stderr: {}", stderr);
+}
+
+#[test]
+fn install_service_rejects_missing_bin_path_value() {
+    let out = doormand()
+        .args(["install-service", "--bin-path"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing value"), "stderr: {}", stderr);
+}
+
+#[test]
+fn no_subcommand_prints_usage_and_succeeds() {
+    let out = doormand().output().unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "stderr: {}", stderr);
+}
+
+#[test]
+fn help_flags_print_usage_and_succeed() {
+    for flag in ["-h", "--help"] {
+        let out = doormand().arg(flag).output().unwrap();
+        assert!(out.status.success(), "flag {} failed", flag);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("usage:"),
+            "flag {}: stderr: {}",
+            flag,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn unknown_subcommand_prints_usage_and_fails() {
+    let out = doormand().arg("bogus").output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown subcommand"), "stderr: {}", stderr);
+    assert!(stderr.contains("usage:"), "stderr: {}", stderr);
+}
+
+#[test]
+fn validate_config_rejects_unknown_flag() {
+    let p = write_tmp(
+        "bad_flag",
+        "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n",
+    );
+    let out = doormand()
+        .args(["validate-config", "--config"])
+        .arg(&p)
+        .arg("--insecure-skip-mode-check")
+        .arg("--nope")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag"), "stderr: {}", stderr);
+    std::fs::remove_file(&p).ok();
+}
+
+#[test]
+fn validate_config_rejects_missing_config_value() {
+    let out = doormand()
+        .args(["validate-config", "--config"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing value"), "stderr: {}", stderr);
+}
+
+#[test]
+fn run_rejects_unknown_flag() {
+    let out = doormand().args(["run", "--nope"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag"), "stderr: {}", stderr);
+}
+
+#[test]
+fn run_rejects_invalid_listen_value() {
+    let p = write_tmp(
+        "run_bad_listen",
+        "- name: a\n  secret: x\n  inject: 'X: {}'\n  hosts: [a.com]\n",
+    );
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let out = doormand()
+        .args(["run", "--config"])
+        .arg(&p)
+        .args(["--listen", "not-an-addr"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--listen"), "stderr: {}", stderr);
+    std::fs::remove_file(&p).ok();
+}
+
+#[test]
+fn run_rejects_missing_flag_values() {
+    for flag in ["--config", "--audit", "--listen"] {
+        let out = doormand().args(["run", flag]).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "flag {} should require a value",
+            flag
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("missing value"),
+            "flag {}: stderr: {}",
+            flag,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn run_rejects_nonexistent_config_file() {
+    let missing =
+        std::env::temp_dir().join(format!("doorman_cli_missing_{}.yaml", std::process::id()));
+    let out = doormand()
+        .args(["run", "--config"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn fingerprint_rejects_missing_target() {
+    let out = doormand().arg("fingerprint").output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("missing"), "stderr: {}", stderr);
+}
+
+#[test]
+fn fingerprint_rejects_extra_arg() {
+    let out = doormand()
+        .args(["fingerprint", "example.com:443", "extra"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unexpected extra arg"),
+        "stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn fingerprint_rejects_invalid_port() {
+    let out = doormand()
+        .args(["fingerprint", "example.com:notaport"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid port"), "stderr: {}", stderr);
+}
+
+#[test]
+fn fingerprint_reports_dial_error_for_unreachable_host() {
+    // Port 0 on loopback never accepts a connection, so this exercises the
+    // dial-failure path without needing network access.
+    let out = doormand()
+        .args(["fingerprint", "127.0.0.1:1"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("dial"), "stderr: {}", stderr);
+}
+
+async fn spawn_one_shot_tls_server() -> (SocketAddr, [u8; 32]) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let key = KeyPair::generate().expect("keypair");
+    let mut params = CertificateParams::default();
+    params.subject_alt_names = vec![SanType::DnsName(
+        Ia5String::try_from("127.0.0.1".to_string()).unwrap(),
+    )];
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "127.0.0.1");
+    params.distinguished_name = dn;
+    let cert = params.self_signed(&key).expect("self-sign");
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let digest = doorman::proxy::sha256(cert.der());
+    let key_der = PrivateKeyDer::try_from(key.serialize_der()).expect("encode key");
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server config");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+            let _ = acceptor.accept(tcp).await;
+        }
+    });
+    (addr, digest)
+}
+
+#[tokio::test]
+async fn fingerprint_prints_matching_sha256_for_reachable_host() {
+    let (addr, digest) = spawn_one_shot_tls_server().await;
+    let expected = format!("sha256:{}", doorman::proxy::hex(&digest));
+
+    let out = tokio::task::spawn_blocking(move || {
+        doormand()
+            .args(["fingerprint", &format!("127.0.0.1:{}", addr.port())])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        out.status.success(),
+        "fingerprint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), expected, "stdout: {}", stdout);
+}
+
+#[tokio::test]
+async fn fingerprint_defaults_to_port_443_when_none_given() {
+    // Binding 127.0.0.1:443 requires root/CAP_NET_BIND_SERVICE; skip
+    // gracefully where that's not available rather than failing spuriously.
+    let Ok(listener) = TcpListener::bind("127.0.0.1:443").await else {
+        return;
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let key = KeyPair::generate().expect("keypair");
+    let mut params = CertificateParams::default();
+    params.subject_alt_names = vec![SanType::DnsName(
+        Ia5String::try_from("127.0.0.1".to_string()).unwrap(),
+    )];
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "127.0.0.1");
+    params.distinguished_name = dn;
+    let cert = params.self_signed(&key).expect("self-sign");
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let digest = doorman::proxy::sha256(cert.der());
+    let key_der = PrivateKeyDer::try_from(key.serialize_der()).expect("encode key");
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server config");
+    tokio::spawn(async move {
+        if let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+            let _ = acceptor.accept(tcp).await;
+        }
+    });
+
+    let expected = format!("sha256:{}", doorman::proxy::hex(&digest));
+    let out = tokio::task::spawn_blocking(|| {
+        doormand()
+            .args(["fingerprint", "127.0.0.1"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        out.status.success(),
+        "fingerprint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), expected, "stdout: {}", stdout);
 }
