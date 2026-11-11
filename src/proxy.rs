@@ -910,17 +910,18 @@ where
     }
 }
 
-/// Addresses doorman refuses to dial: cloud metadata (169.254.0.0/16),
-/// CGNAT (100.64.0.0/10, used by some metadata/relay services), IPv6
-/// link-local (fe80::/10), and the unspecified address (which means
-/// "this host" on v4 and "any" on v6). Not private/ULA ranges — those
-/// are the declared-LAN case, see [`entry_declares_lan`].
+/// Addresses doorman refuses to dial: cloud metadata/link-local (169.254.0.0/16), the two
+/// well-known services in shared address space (Alibaba metadata 100.100.100.200, Tailscale
+/// 100.100.100.100), IPv6 link-local (fe80::/10), and unspecified. The rest of 100.64.0.0/10
+/// is dialable: zero-trust corporate networks answer private-app names from it. Private/ULA
+/// ranges are the declared-LAN case, see [`entry_declares_lan`].
 fn is_link_local_or_metadata(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             o[0] == 169 && o[1] == 254 // 169.254.0.0/16 link-local + metadata
-                || (o[0] == 100 && o[1] & 0xc0 == 64) // 100.64.0.0/10 CGNAT
+                || o == [100, 100, 100, 200] // Alibaba Cloud metadata
+                || o == [100, 100, 100, 100] // Tailscale local DNS/web client
                 || o == [0, 0, 0, 0] // unspecified
         }
         IpAddr::V6(v6) => {
@@ -1382,11 +1383,13 @@ mod tests {
         // Cloud metadata and link-local: refused.
         assert!(is_link_local_or_metadata(ip("169.254.169.254")));
         assert!(is_link_local_or_metadata(ip("169.254.1.1")));
-        // CGNAT range: refused.
-        assert!(is_link_local_or_metadata(ip("100.64.0.1")));
-        assert!(is_link_local_or_metadata(ip("100.127.255.255")));
-        assert!(!is_link_local_or_metadata(ip("100.128.0.0")));
-        assert!(!is_link_local_or_metadata(ip("100.63.255.255")));
+        // Shared address space: only its two well-known service addresses are refused.
+        assert!(is_link_local_or_metadata(ip("100.100.100.200")));
+        assert!(is_link_local_or_metadata(ip("100.100.100.100")));
+        assert!(!is_link_local_or_metadata(ip("100.100.100.201")));
+        assert!(!is_link_local_or_metadata(ip("100.64.0.1")));
+        assert!(!is_link_local_or_metadata(ip("100.127.0.4")));
+        assert!(!is_link_local_or_metadata(ip("100.127.255.255")));
         // IPv6 link-local fe80::/10: refused; site-local-ish fec0::/10 is not.
         assert!(is_link_local_or_metadata(ip("fe80::1")));
         assert!(is_link_local_or_metadata(ip("febf::ffff")));
