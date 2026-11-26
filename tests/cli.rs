@@ -590,6 +590,25 @@ fn run_binds_writes_audit_config_load_and_shuts_down_on_sigterm() {
 }
 
 #[test]
+fn sigterm_arriving_the_instant_the_proxy_listens_still_shuts_down_gracefully() {
+    // The helper kills on the "listening on" line, which is the tightest window a real supervisor
+    // hits: the signal handler must already be installed when the daemon prints that line.
+    let p = write_tmp("run_sigterm_race", "- name: github\n  secret: ghp_x\n  inject: 'Authorization: Bearer {}'\n  hosts: [api.github.com]\n");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+    for i in 0..20 {
+        let (stderr, audit_path) = run_and_capture_stderr(&p, &["--allow-same-uid"]);
+        assert!(
+            stderr.contains("listening on") && stderr.contains("SIGTERM, shutting down"),
+            "iteration {}: expected a graceful shutdown after racing SIGTERM, got: {}",
+            i,
+            stderr
+        );
+        std::fs::remove_file(&audit_path).ok();
+    }
+    std::fs::remove_file(&p).ok();
+}
+
+#[test]
 fn install_service_rejects_unknown_flag() {
     let out = doormand()
         .args(["install-service", "--nope"])

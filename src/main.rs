@@ -797,24 +797,26 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
     runtime.block_on(async move {
-        let serve = proxy::run(server, listen);
-        let sigterm = async {
-            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        // Register the handlers before `proxy::run` prints "listening on": a supervisor that kills
+        // on that line inside the unguarded window gets the default disposition, losing the
+        // graceful shutdown line and the audit flush.
+        let mut term_sig =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("install SIGTERM handler");
-            sig.recv().await;
-        };
-        let sigint = async {
-            tokio::signal::ctrl_c().await.ok();
-        };
+        let mut int_sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("install SIGINT handler");
+        let mut hup_sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("install SIGHUP handler");
+        let serve = proxy::run(server, listen);
+        let sigterm = async { term_sig.recv().await };
+        let sigint = async { int_sig.recv().await };
         // SIGHUP reopens the audit log and attempts an atomic policy reload.
         // A failed validation leaves the last known-good policy untouched.
         let audit_for_sighup = Arc::clone(&audit);
         let policy_for_sighup = Arc::clone(&policy);
         let config_for_sighup = config_path.clone();
         let sighup = async move {
-            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                .expect("install SIGHUP handler");
-            while sig.recv().await.is_some() {
+            while hup_sig.recv().await.is_some() {
                 match audit_for_sighup.reopen() {
                     Ok(()) => eprintln!("SIGHUP, audit log reopened"),
                     Err(e) => eprintln!("SIGHUP, audit reopen failed: {}", e),
