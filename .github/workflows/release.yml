@@ -32,11 +32,11 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
           # Cross-compiled from arm64. macos-13 (Intel) runners are being
           # phased out and routinely block on capacity.
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
